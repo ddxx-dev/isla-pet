@@ -1,0 +1,26 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# IDE / 本地工具配置
+.qoder/
+.workbuddy/
+.idea/
+.vscode/
+
+# 运行时产生的用户数据
+isla_save.json
+isla_save.bak
+isla_save.json.bak
+*.tmp
+
+# 日志
+*.log
+
+# 构建产物
+dist/
+build/
+*.spec.bak
+
+# 测试输出
+selftest_out.txt

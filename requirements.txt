@@ -1,0 +1,8 @@
+# 运行时依赖
+# 注意：白噪音使用 QtMultimedia，必须装 pyside6-addons（含 essentials）
+# 只装 pyside6-essentials 会导致白噪音功能自动降级不可用
+pyside6-addons>=6.6.0
+pillow>=10.0.0
+
+# 打包（可选，仅构建 exe 时需要）：
+# pyinstaller>=6.0
