@@ -6,6 +6,7 @@ IslaPet —— 以《可塑性记忆》艾拉为灵感的原创桌面宠物
      骰子/硬币/跳舞/烟花/白噪音/每日运势/时间胶囊/成就/记忆碎片/主题换肤等。
 """
 import ctypes
+import ctypes.wintypes as wintypes
 import json
 import logging
 import math
@@ -62,6 +63,18 @@ def _init_logging():
             format="%(asctime)s %(levelname)s %(message)s")
     except OSError:
         logging.basicConfig(level=logging.INFO)
+
+
+def _install_excepthook():
+    """未捕获异常落盘：windowed exe 没有控制台，否则崩溃时桌宠凭空消失、查无痕迹。"""
+    def hook(etype, value, tb):
+        try:
+            logging.critical("未捕获异常，程序即将退出",
+                             exc_info=(etype, value, tb))
+        except Exception:
+            pass
+        sys.__excepthook__(etype, value, tb)
+    sys.excepthook = hook
 
 
 # ---- 时序与动画常量（tick = 100ms 心跳一格） ----
@@ -162,6 +175,8 @@ DEFAULT_SAVE = {
     "noise_on": False,           # 白噪音开关
     "fortune": None,             # 今日运势 ["YYYY-MM-DD", 等级, 内容]
     "reminders": [],             # 自定义提醒 [[到期ISO时间, 内容], ...]
+    "pomo": None,                # 进行中的番茄钟 [阶段, 结束ISO时间]
+    "dnd_on": True,              # 前台全屏时自动免打扰（改托盘通知）
 }
 
 
@@ -264,7 +279,10 @@ class SpeechBubble(QWidget):
         self.setWindowOpacity(1.0)
         self.show()
         self.update()
-        self._timer.start(BUBBLE_SHOW_MS)
+        # 长内容多给点阅读时间：短句 4 秒起步，每行再加约 1.1 秒，最多 14 秒
+        extra = 1.1 * (max(1, len(text) // 14) - 1)
+        self._timer.start(int(min(BUBBLE_SHOW_MS * 3.5,
+                                  BUBBLE_SHOW_MS + extra * 1000)))
 
     def _on_fade_done(self):
         """淡出完毕后播放下一条排队台词。"""
@@ -490,10 +508,22 @@ class IslaPet(QWidget):
         self.initiative_cd = random.randint(2400, 4800)  # 主动搭话冷却
         self.mood_decay = 0          # 心情衰减计时
         self._sad_hint_done = False  # 心情低谷求助提示（只提示一次）
+        self.fullscreen_quiet = False  # 前台全屏中（免打扰）
 
         # 番茄钟 / 自定义提醒
         self.pomo_state = None       # None / "focus" / "break"
         self.pomo_end = None
+        # 恢复上次进行中的番茄钟（已过期的丢弃，不再补播提示）
+        pomo = self.save.get("pomo")
+        if isinstance(pomo, (list, tuple)) and len(pomo) == 2:
+            try:
+                end = datetime.fromisoformat(pomo[1])
+                if end > datetime.now():
+                    self.pomo_state, self.pomo_end = pomo[0], end
+                else:
+                    self.save["pomo"] = None
+            except (ValueError, TypeError):
+                self.save["pomo"] = None
 
         # ---- v2.0 新功能状态 ----
         self.dance_seq = []          # 跳舞姿势序列
@@ -507,6 +537,8 @@ class IslaPet(QWidget):
         self.tray = None             # 系统托盘（由 main 注入，用于气泡通知）
         self.firework = None         # 全屏烟花窗口（懒创建）
         self._load_noise()           # 后台预生成白噪音 wav（失败无害）
+        if self.save.get("noise_on"):
+            QTimer.singleShot(1500, self._restore_noise)   # 恢复上次的白噪音
         self._check_achievements(silent=True)   # 启动静默同步已满足成就
 
         self._check_login_streak()
@@ -569,6 +601,9 @@ class IslaPet(QWidget):
         self.save["reminders"] = [[t.isoformat(), txt]
                                   for t, txt in self.reminders]
         self.save["total_seconds"] = self._acc_seconds
+        # 番茄钟进行中就存下来，重启后接着走（过期的在启动时丢弃）
+        self.save["pomo"] = ([self.pomo_state, self.pomo_end.isoformat()]
+                             if self.pomo_state and self.pomo_end else None)
         path = data_file()
         tmp = path + ".tmp"
         try:
@@ -843,15 +878,17 @@ class IslaPet(QWidget):
             # 跟随鼠标散步优先于自由闲逛
             if not self.sleeping and self.save.get("follow_on"):
                 self._follow_step()
-            # 没事的时候在屏幕上闲逛
-            elif not self.sleeping and self.save.get("wander_on", True) \
+            # 没事的时候在屏幕上闲逛（全屏免打扰时停下来）
+            elif not self.sleeping and not self.fullscreen_quiet \
+                    and self.save.get("wander_on", True) \
                     and not self._wandering() \
                     and not self.bubble.isVisible():
                 self.wander_cooldown -= 1
                 if self.wander_cooldown <= 0:
                     self._start_wander()
-            # 偶尔主动搭话（番茄钟专注期间保持安静）
-            if not self.sleeping and self.save.get("initiative_on", True) \
+            # 偶尔主动搭话（番茄钟专注期间、全屏时保持安静）
+            if not self.sleeping and not self.fullscreen_quiet \
+                    and self.save.get("initiative_on", True) \
                     and self.pomo_state != "focus" \
                     and not self.bubble.isVisible():
                 self.initiative_cd -= 1
@@ -932,10 +969,47 @@ class IslaPet(QWidget):
         p.restore()
 
     # ---------- 台词 ----------
-    def say(self, text):
+    def say(self, text, force=False):
+        """弹出台词气泡。全屏免打扰时改为托盘通知（force=True 可强制弹窗）。"""
+        if self.fullscreen_quiet and not force:
+            self._notify("艾拉", text)
+            return
         self.bubble.theme = self.save.get("theme", "樱花粉")
         r = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
         self.bubble.popup(text, r)
+
+    @staticmethod
+    def _is_foreground_fullscreen():
+        """前台窗口是否占满整屏（全屏游戏/视频/投屏时别去打扰）。"""
+        try:
+            u32 = ctypes.windll.user32
+            hwnd = u32.GetForegroundWindow()
+            if not hwnd or hwnd == u32.GetShellWindow():
+                return False                       # 无前台窗口 / 桌面
+            rect = wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(rect))
+            if u32.IsIconic(hwnd):                 # 最小化窗口不算
+                return False
+            return (rect.right - rect.left >= u32.GetSystemMetrics(0) and
+                    rect.bottom - rect.top >= u32.GetSystemMetrics(1))
+        except Exception:
+            return False
+
+    def _update_dnd(self):
+        """刷新免打扰状态：进入/退出全屏时各提示一次。"""
+        if not self.save.get("dnd_on", True):
+            if self.fullscreen_quiet:
+                self.fullscreen_quiet = False
+            return
+        now_full = self._is_foreground_fullscreen()
+        if now_full == self.fullscreen_quiet:
+            return
+        self.fullscreen_quiet = now_full
+        if now_full:
+            self._stop_wander()
+            self._notify("艾拉", "你在忙……我先安静一会儿。")
+        else:
+            self.say(self.bank.pick("dnd_off"))
 
     def _greet(self):
         h = datetime.now().hour
@@ -1132,6 +1206,11 @@ class IslaPet(QWidget):
         act.setCheckable(True)
         act.setChecked(bool(self.save.get("noise_on", False)))
         act.toggled.connect(self._toggle_noise)
+        beh.addAction(act)
+        act = QAction("全屏时自动安静", beh)
+        act.setCheckable(True)
+        act.setChecked(bool(self.save.get("dnd_on", True)))
+        act.toggled.connect(lambda on: self.save.__setitem__("dnd_on", on))
         beh.addAction(act)
 
         tools = m.addMenu("小工具")
@@ -1506,7 +1585,7 @@ class IslaPet(QWidget):
         self._set_temp_state("panic", 1.8)
         self.hop_ticks = 12
         self._spawn_hearts(5)
-        self.say(self.bank.pick("alarm_fire"))
+        self.say(self.bank.pick("alarm_fire", time=hm))
         self._notify("闹钟", "到点了，起来活动一下吧！")
         self.save_data()
 
@@ -1588,6 +1667,21 @@ class IslaPet(QWidget):
             self.noise.stop()
             self.say(self.bank.pick("noise_off"))
         self.save_data()
+
+    def _restore_noise(self):
+        """启动时恢复上次开启的白噪音（wav 可能还在后台线程生成）。"""
+        if not self.save.get("noise_on"):
+            return
+        if not self.noise and self._noise_ready:
+            self._setup_noise(self._noise_path())
+        if self.noise:
+            self.noise.play()
+            return
+        self._noise_retry = getattr(self, "_noise_retry", 0) + 1
+        if self._noise_retry <= 5:               # 最多再等 15 秒
+            QTimer.singleShot(3000, self._restore_noise)
+        else:
+            self.save["noise_on"] = False        # 始终不可用则复位开关，避免菜单勾选误导
 
     # ---------- 全屏烟花 ----------
     def _show_firework(self):
@@ -1785,6 +1879,7 @@ class IslaPet(QWidget):
         self._reminder_check()
         self._capsule_check()
         self._alarm_check()
+        self._update_dnd()
         if not self.noise and self._noise_ready:   # 白噪音文件后台生成完毕
             self._setup_noise(self._noise_path())
 
@@ -1813,6 +1908,7 @@ class IslaPet(QWidget):
 
 def main():
     _init_logging()
+    _install_excepthook()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)

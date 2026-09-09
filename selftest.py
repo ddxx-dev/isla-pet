@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """对 IslaPet 的新功能做无人值守自测：逐个调用方法并捕获异常。"""
+import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timedelta
@@ -14,6 +16,40 @@ import isla_pet
 
 results = []
 
+
+def _placeholder_problems():
+    """台词里的 {xxx} 必须在对应 pick() 调用里传参，否则会原样显示给用户。
+
+    只校验字面量 key 的调用（pick("key", ...)）；通过变量传 key 的动态调用
+    无法静态判定，跳过以免误报。
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        bank = json.load(open(os.path.join(base, "dialogues.json"),
+                              encoding="utf-8"))
+        src = open(os.path.join(base, "isla_pet.py"), encoding="utf-8").read()
+    except OSError as exc:
+        return ["读取失败: %s" % exc]
+    bad = []
+    for key, lines in bank.items():
+        ph = set()
+        for ln in lines:
+            ph |= set(re.findall(r"\{(\w+)\}", ln))
+        if not ph:
+            continue
+        calls = re.findall(
+            r'pick\(\s*["\']' + re.escape(key) + r'["\']\s*([^)]*)\)', src)
+        if not calls:
+            continue
+        provided = set()
+        for rest in calls:
+            provided |= set(re.findall(r"(\w+)\s*=", rest))
+        missing = ph - provided
+        if missing:
+            bad.append("%s 缺少 %s" % (key, sorted(missing)))
+    return bad
+
+
 # 代码实际引用的全部台词分类（与 dialogues.json 对照）
 REQUIRED_KEYS = [
     "greeting_morning", "greeting_afternoon", "greeting_evening",
@@ -23,7 +59,7 @@ REQUIRED_KEYS = [
     "double_click", "drag", "drop", "rps_win", "rps_lose", "rps_draw",
     "follow_on", "follow_off", "hourly_chime", "sit_reminder",
     "sleep_reminder", "hidden", "wake_up", "farewell", "initiative",
-    "mood_high", "mood_low", "mood_sad_hint", "pomodoro_start",
+    "mood_high", "mood_low", "mood_sad_hint", "dnd_off", "pomodoro_start",
     "pomodoro_focus_end", "pomodoro_break_end", "pomodoro_stop",
     "reminder_set", "reminder_fire", "reminder_none", "pc_status_ok",
     "pc_status_busy", "festival", "birthday", "anniversary",
@@ -46,6 +82,7 @@ QInputDialog.getInt = staticmethod(lambda *a, **k: (25, True))
 
 
 def check(name, fn):
+    print("  RUN  %s" % name, flush=True)   # 进度输出：卡住时能定位到具体项
     try:
         fn()
         results.append((True, name, ""))
@@ -195,6 +232,9 @@ check("闹钟设置", pet._set_alarm)
 check("闹钟到点触发", lambda: (
     pet.save["alarms"].append(datetime.now().strftime("%H:%M")),
     pet._alarm_check()))
+check("闹钟台词无未填充占位符", lambda: (
+    "{" not in pet.bank.pick("alarm_fire", time="08:00") or (
+        _ for _ in ()).throw(AssertionError("闹钟台词含未填充的 {time}"))))
 check("主题换肤", lambda: (
     pet._set_theme("薄荷蓝"),
     pet.save["theme"] == "薄荷蓝" or (_ for _ in ()).throw(
@@ -229,6 +269,42 @@ check("提醒持久化到存档", lambda: (
     isinstance(pet.save.get("reminders"), list)
     and len(pet.save["reminders"]) >= 1 or (_ for _ in ()).throw(
         AssertionError("reminders 未写入存档"))))
+_PH_BAD = _placeholder_problems()
+check("台词占位符与传参一致", lambda: (
+    not _PH_BAD or (_ for _ in ()).throw(
+        AssertionError("占位符未传参: " + "; ".join(_PH_BAD)))))
+check("全屏检测不抛异常", lambda: (
+    isinstance(pet._is_foreground_fullscreen(), bool) or (
+        _ for _ in ()).throw(AssertionError("全屏检测返回值异常"))))
+check("免打扰状态切换", lambda: (
+    setattr(pet, "fullscreen_quiet", False),
+    pet.save.update({"dnd_on": True}),
+    pet._update_dnd(),
+    setattr(pet, "fullscreen_quiet", True), pet._update_dnd(),
+    not pet.fullscreen_quiet or (
+        _ for _ in ()).throw(AssertionError("退出免打扰失败")),
+    setattr(pet, "fullscreen_quiet", False)))
+check("免打扰时台词走托盘", lambda: (
+    pet.bubble.hide(),                          # 先清掉可能残留的气泡
+    setattr(pet, "fullscreen_quiet", True),
+    pet.say("测试免打扰"),
+    not pet.bubble.isVisible() or (
+        _ for _ in ()).throw(AssertionError("免打扰时仍弹了气泡")),
+    setattr(pet, "fullscreen_quiet", False)))
+check("气泡长内容停留更久", lambda: (
+    setattr(pet, "fullscreen_quiet", False),    # 兜底复位，防前项残留
+    pet.bubble.hide(), pet.say("短"),
+    setattr(pet, "_short_ms", pet.bubble._timer.interval()),
+    pet.bubble.hide(), pet.say("很长的一句台词" * 20),
+    setattr(pet, "_long_ms", pet.bubble._timer.interval()),
+    pet._long_ms > pet._short_ms or (_ for _ in ()).throw(
+        AssertionError("长文本未延长: %s -> %s"
+                       % (pet._short_ms, pet._long_ms)))))
+check("番茄钟存盘与恢复", lambda: (
+    pet._pomo_start("focus"),
+    pet.save_data(),
+    (pet.save.get("pomo") or [None])[0] == "focus" or (
+        _ for _ in ()).throw(AssertionError("番茄钟未写入存档"))))
 check("存档写入", pet.save_data)
 
 
