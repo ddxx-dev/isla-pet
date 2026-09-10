@@ -71,6 +71,7 @@ REQUIRED_KEYS = [
     "capsule_bad_date", "capsule_past", "fortune_big", "fortune_mid",
     "fortune_small", "fortune_bad", "alarm_set", "alarm_fire",
     "alarm_bad_time", "theme_change", "noise_on", "noise_off", "firework",
+    "brief_start", "brief_end", "brief_fail",
 ]
 
 # 输入框打桩：时间胶囊(文本, 日期) -> 闹钟(时间)
@@ -305,6 +306,78 @@ check("番茄钟存盘与恢复", lambda: (
     pet.save_data(),
     (pet.save.get("pomo") or [None])[0] == "focus" or (
         _ for _ in ()).throw(AssertionError("番茄钟未写入存档"))))
+
+# ---- 每日早报（60s 摘要） ----
+check("早报解析与截断", lambda: (
+    (lambda items: (len(items) == 2 and items[0].endswith("…")
+                    and len(items[0]) <= isla_pet.BRIEF_ITEM_CHARS + 1
+                    and items[1] == "短新闻")
+     or (_ for _ in ()).throw(AssertionError("解析结果不符")))(
+        isla_pet.IslaPet._parse_brief(
+            {"data": {"news": ["长" * 100, "短新闻", "第三条"]}}))))
+check("早报截断优先断句", lambda: (
+    isla_pet.IslaPet._clip_brief(
+        "今天天气不错。大家都很开心。" + "尾巴" * 40).endswith("。")
+    or (_ for _ in ()).throw(AssertionError("未断在句号处"))))
+check("早报播放并落档", lambda: (
+    setattr(pet, "_brief_pending", True),
+    setattr(pet, "_brief_result", ["测试新闻一", "测试新闻二"]),
+    setattr(pet, "_brief_manual", False),
+    pet._brief_tick(),
+    pet.save.get("brief_date") == datetime.now().date().isoformat()
+    or (_ for _ in ()).throw(AssertionError("brief_date 未写入"))))
+check("早报失败走兜底台词", lambda: (
+    setattr(pet, "_brief_pending", True),
+    setattr(pet, "_brief_result", []),
+    setattr(pet, "_brief_manual", True),
+    pet._brief_tick(),
+    pet._brief_pending is False or (_ for _ in ()).throw(
+        AssertionError("失败后未复位拉取状态"))))
+check("早报当天已读不重复拉取", lambda: (
+    setattr(pet, "_brief_pending", False),
+    setattr(pet, "_brief_result", None),
+    pet.save.update({"brief_date": datetime.now().date().isoformat()}),
+    pet._daily_brief(),
+    pet._brief_pending is False or (_ for _ in ()).throw(
+        AssertionError("当天已读仍在拉取"))))
+
+_real_datetime = isla_pet.datetime
+
+
+def _patch_hour(h):
+    """临时把模块内 datetime.now() 钉到指定小时，测自动触发条件。"""
+    class _FakeDT(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_datetime(2026, 9, 11, h, 0, 0)
+    isla_pet.datetime = _FakeDT
+
+
+def _restore_hour():
+    isla_pet.datetime = _real_datetime
+
+
+check("早报 7 点后未读时自动拉取", lambda: (
+    setattr(pet, "pomo_state", None),      # 前项测试开着番茄钟，专注期间早报应静默
+    setattr(pet, "_brief_pending", False),
+    setattr(pet, "_brief_result", None),
+    setattr(pet, "_brief_attempt_day", None),
+    pet.save.update({"brief_on": True, "brief_date": None}),
+    _patch_hour(8), pet._brief_maybe_auto(), _restore_hour(),
+    pet._brief_pending is True or (_ for _ in ()).throw(
+        AssertionError("7 点后未触发自动拉取")),
+    setattr(pet, "_brief_pending", False),
+    setattr(pet, "_brief_result", None)))
+check("早报 7 点前不触发", lambda: (
+    setattr(pet, "pomo_state", None),
+    setattr(pet, "_brief_pending", False),
+    setattr(pet, "_brief_result", None),
+    setattr(pet, "_brief_attempt_day", None),
+    pet.save.update({"brief_on": True, "brief_date": None}),
+    _patch_hour(5), pet._brief_maybe_auto(), _restore_hour(),
+    pet._brief_pending is False or (_ for _ in ()).throw(
+        AssertionError("7 点前不应拉取")),
+    setattr(pet, "_brief_result", None)))
 check("存档写入", pet.save_data)
 
 

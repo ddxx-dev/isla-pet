@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
 from array import array
 from copy import deepcopy
@@ -106,6 +107,14 @@ FESTIVALS = {
 }
 RPS = ("石头", "剪刀", "布")
 
+# ---- 每日早报（60s 读懂世界） ----
+BRIEF_API = "https://60s.viki.moe/v2/60s"
+BRIEF_TIMEOUT = 6                   # 拉取超时秒数（后台线程，不阻塞主线程）
+BRIEF_NEWS_COUNT = 2                # 每天最多朗读条数
+BRIEF_ITEM_CHARS = 36               # 单条截断长度
+BRIEF_MIN_CLIP = 8                  # 截断优先断句时的最小保留长度
+BRIEF_MIN_HOUR = 7                  # 早报最早自动播报时间（点）
+
 # ---- 主题换肤：气泡 / 粒子 / 烟花主色调 ----
 THEMES = {
     "樱花粉":  {"bubble": (225, 120, 130), "particle": (240, 120, 150),
@@ -158,6 +167,7 @@ def _def_achievements():
 DEFAULT_SAVE = {
     "affection": 0, "unlocked": 0, "pos": None, "size_key": DEFAULT_SIZE,
     "chime_on": True, "sit_on": True, "sleep_on": True, "wander_on": True,
+    "brief_on": True, "brief_date": None,   # 每日早报开关 / 当天已读日期
     "follow_on": False, "initiative_on": True,
     "mood": 60,                  # 心情 0~100
     "streak": 0, "last_login": None,
@@ -525,6 +535,12 @@ class IslaPet(QWidget):
             except (ValueError, TypeError):
                 self.save["pomo"] = None
 
+        # ---- 每日早报状态 ----
+        self._brief_pending = False     # 后台拉取进行中
+        self._brief_result = None       # 拉取结果（列表；None=尚未返回）
+        self._brief_manual = False      # 本次是否手动点播
+        self._brief_attempt_day = None  # 当天已尝试的日期（失败不反复请求）
+
         # ---- v2.0 新功能状态 ----
         self.dance_seq = []          # 跳舞姿势序列
         self.dance_timer = QTimer(self)
@@ -547,6 +563,7 @@ class IslaPet(QWidget):
         self.show()
         QTimer.singleShot(600, self._greet)
         QTimer.singleShot(5200, self._daily_notes)
+        QTimer.singleShot(17000, self._brief_maybe_auto)
 
     # ---------- 存档 ----------
     def _load_save(self):
@@ -1081,6 +1098,93 @@ class IslaPet(QWidget):
             return ("anniversary", {"name": name, "days": days})
         return None
 
+    # ---------- 每日早报（60s 读懂世界） ----------
+    @staticmethod
+    def _clip_brief(text):
+        """长新闻截断到 BRIEF_ITEM_CHARS 附近，尽量断在标点处。"""
+        cut = text[:BRIEF_ITEM_CHARS]
+        for sep in ("。", "，", "；", "、", " "):
+            idx = cut.rfind(sep)
+            if idx >= BRIEF_MIN_CLIP:
+                return cut[:idx + 1]
+        return cut + "…"
+
+    @classmethod
+    def _parse_brief(cls, data):
+        """从 API JSON 里提取前几条短讯并截断（纯函数，便于测试）。"""
+        raw = ((data or {}).get("data") or {}).get("news") or []
+        items = []
+        for line in raw[:BRIEF_NEWS_COUNT]:
+            line = str(line).strip()
+            if not line:
+                continue
+            if len(line) > BRIEF_ITEM_CHARS:
+                line = cls._clip_brief(line)
+            items.append(line)
+        return items
+
+    def _fetch_brief_bg(self):
+        """后台线程拉取早报；无论成败都不向主线程抛异常。"""
+        items = []
+        try:
+            req = urllib.request.Request(
+                BRIEF_API,
+                headers={"User-Agent": "%s/%s" % (APP_NAME, APP_VERSION)})
+            with urllib.request.urlopen(req, timeout=BRIEF_TIMEOUT) as resp:
+                items = self._parse_brief(
+                    json.loads(resp.read().decode("utf-8")))
+        except Exception as exc:
+            logging.info("早报拉取失败：%s", exc)
+        self._brief_result = items
+
+    def _daily_brief(self, manual=False):
+        """每日早报：后台拉取 60s 摘要，拉好了念给你听。"""
+        if self._brief_pending:
+            return
+        if not manual:
+            if not self.save.get("brief_on", True):
+                return
+            if self.save.get("brief_date") == date.today().isoformat():
+                return               # 今天已经读过了
+            self._brief_attempt_day = date.today().isoformat()
+        self._brief_pending = True
+        self._brief_manual = manual
+        self._brief_result = None
+        threading.Thread(target=self._fetch_brief_bg, daemon=True).start()
+
+    def _brief_maybe_auto(self):
+        """每天 BRIEF_MIN_HOUR 点后自动播报一次（专注/已读/已试过则跳过）。"""
+        if self.pomo_state == "focus":
+            return
+        if not self.save.get("brief_on", True):
+            return
+        if datetime.now().hour < BRIEF_MIN_HOUR:
+            return
+        if self.save.get("brief_date") == date.today().isoformat():
+            return
+        if self._brief_attempt_day == date.today().isoformat():
+            return
+        self._daily_brief()
+
+    def _brief_tick(self):
+        """秒级轮询：后台结果就绪后播报（失败给兜底台词）。"""
+        if not self._brief_pending or self._brief_result is None:
+            return
+        items, manual = self._brief_result, self._brief_manual
+        self._brief_pending = False
+        self._brief_result = None
+        if not items:
+            if manual:
+                self.say(self.bank.pick("brief_fail"))
+            return
+        self.save["brief_date"] = date.today().isoformat()
+        head = self.bank.pick("brief_start")
+        tail = self.bank.pick("brief_end")
+        body = "\n".join("· " + it for it in items)
+        self.say(head + "\n" + body + "\n" + tail)
+        self.add_affection(1)
+        self.save_data()
+
     # ---------- 好感度 ----------
     AFFECTION_THRESHOLDS = (30, 80, 160)  # 每达到一档解锁 1 条隐藏台词
 
@@ -1212,6 +1316,11 @@ class IslaPet(QWidget):
         act.setChecked(bool(self.save.get("dnd_on", True)))
         act.toggled.connect(lambda on: self.save.__setitem__("dnd_on", on))
         beh.addAction(act)
+        act = QAction("每日早报（60s 世界）", beh)
+        act.setCheckable(True)
+        act.setChecked(bool(self.save.get("brief_on", True)))
+        act.toggled.connect(lambda on: self.save.__setitem__("brief_on", on))
+        beh.addAction(act)
 
         tools = m.addMenu("小工具")
         if self.pomo_state:
@@ -1224,6 +1333,7 @@ class IslaPet(QWidget):
         tools.addAction("查看待办（%d）" % len(self.reminders),
                         self._show_reminders)
         tools.addAction("看看电脑状态", self._pc_status)
+        tools.addAction("读今日热点", lambda: self._daily_brief(True))
         tools.addSeparator()
         tools.addAction("今日运势", self._fortune)
         tools.addAction("写时间胶囊…", self._add_capsule)
@@ -1880,6 +1990,7 @@ class IslaPet(QWidget):
         self._capsule_check()
         self._alarm_check()
         self._update_dnd()
+        self._brief_tick()
         if not self.noise and self._noise_ready:   # 白噪音文件后台生成完毕
             self._setup_noise(self._noise_path())
 
@@ -1904,6 +2015,8 @@ class IslaPet(QWidget):
                 and now.minute >= 30 and self.sleep_reminded_day != date.today():
             self.sleep_reminded_day = date.today()
             self.say(self.bank.pick("sleep_reminder"))
+        # 每天 BRIEF_MIN_HOUR 点后自动补发一次早报（当天未读过时）
+        self._brief_maybe_auto()
 
 
 def main():
