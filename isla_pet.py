@@ -312,8 +312,16 @@ class SpeechBubble(QWidget):
             self._reposition()
         return False
 
-    def _place(self, anchor_rect):
-        """把气泡放到 anchor_rect 正上方，并夹取到屏幕可见区域内。"""
+    def _place(self, anchor_rect=None):
+        """把气泡放到角色正上方并夹取到屏幕可见区域内。
+        有 anchor 时一律采用角色**实时**位置，忽略传入的旧快照矩形——
+        否则排队/延迟台词（如猜拳、抛硬币的第二条）会弹在角色几秒前的
+        旧位置，且角色静止后不再触发 Move 事件，气泡就永远错在那里。"""
+        if self._anchor is not None:
+            a = self._anchor
+            anchor_rect = QRect(a.mapToGlobal(QPoint(0, 0)), a.size())
+        if anchor_rect is None:
+            return
         w = self.width()
         h = self.height() - 10
         x = anchor_rect.center().x() - w // 2
@@ -326,11 +334,10 @@ class SpeechBubble(QWidget):
         self.move(x, y)
 
     def _reposition(self):
-        """跟随定时器回调：按角色当前实时位置重定位气泡（闲逛/拖拽时不脱节）。"""
+        """跟随角色 Move/Resize 事件实时重定位气泡。"""
         if self._anchor is None or not self.isVisible():
             return
-        a = self._anchor
-        self._place(QRect(a.mapToGlobal(QPoint(0, 0)), a.size()))
+        self._place()
 
     def _on_fade_done(self):
         """淡出完毕后播放下一条排队台词。"""

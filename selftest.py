@@ -7,7 +7,7 @@ import sys
 import traceback
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QTimer, Qt
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 
@@ -460,6 +460,13 @@ check("气泡跟随角色移动（守卫）", lambda: (
     abs((pet.bubble.x() + pet.bubble.width() // 2)
         - (pet.x() + pet.width() // 2)) <= 6 or (
         _ for _ in ()).throw(AssertionError("气泡未跟随角色居中")),
+    pet.bubble._on_fade_done()))
+check("气泡用实时定位（排队回放不脱节）", lambda: (
+    pet.move(1000, 300), app.processEvents(),
+    pet.bubble._show("回放台词", QRect(50, 50, 10, 10)), app.processEvents(),
+    abs((pet.bubble.x() + pet.bubble.width() // 2)
+        - (pet.x() + pet.width() // 2)) <= 6 or (
+        _ for _ in ()).throw(AssertionError("气泡未采用角色实时位置")),
     pet.bubble._on_fade_done()))
 
 
