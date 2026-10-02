@@ -381,6 +381,88 @@ check("早报 7 点前不触发", lambda: (
 check("存档写入", pet.save_data)
 
 
+# ---- v2.2 升级：动画手感 / 性能守卫 / 常量化 ----
+def _count_updates(pet, ticks):
+    """临时遮蔽 pet.update，统计 ticks 次 _tick 实际触发了几次重绘。"""
+    box = [0]
+    pet.update = lambda *a, **k: box.__setitem__(0, box[0] + 1)
+    try:
+        for _ in range(ticks):
+            pet._tick()
+    finally:
+        del pet.update          # 去掉实例遮蔽，恢复类方法
+    return box[0]
+
+
+def _force_wander(pet):
+    from PySide6.QtCore import QPropertyAnimation
+    a = QPropertyAnimation(pet, b"pos")
+    a.setDuration(20000)
+    a.setStartValue(pet.pos())
+    a.setEndValue(pet.pos() + QPoint(300, 0))
+    a.start()
+    pet.wander_anim = a
+
+
+check("v2.2 新常量已定义", lambda: (
+    all(hasattr(isla_pet, k) for k in (
+        "MOOD_SAD", "MOOD_HIGH", "MOOD_LOW", "INITIATIVE_CD",
+        "BLINK_CHANCE", "WALK_BOB", "BREATH_SCALE")) or (
+        _ for _ in ()).throw(AssertionError("缺少 v2.2 常量"))))
+check("步态相位仅在移动时推进", lambda: (
+    setattr(pet, "wander_anim", None), setattr(pet, "walk_phase", 0.0),
+    pet._tick(),
+    pet.walk_phase == 0.0 or (_ for _ in ()).throw(
+        AssertionError("非移动时步态不应推进")),
+    _force_wander(pet), [pet._tick() for _ in range(5)],
+    pet.walk_phase > 0.0 or (_ for _ in ()).throw(
+        AssertionError("移动时步态未推进")),
+    pet._stop_wander()))
+check("休眠静帧跳过重绘（守卫）", lambda: (
+    setattr(pet, "wander_anim", None),
+    setattr(pet, "sleeping", True), setattr(pet, "state", "sleep"),
+    setattr(pet, "hearts", []), setattr(pet, "hop_ticks", 0),
+    setattr(pet, "dragging", False), setattr(pet, "temp_state_ticks", 0),
+    setattr(pet, "_last_painted_state", "sleep"),
+    _count_updates(pet, 3) == 0 or (_ for _ in ()).throw(
+        AssertionError("休眠静帧不应重绘"))))
+check("姿势变化强制重绘（守卫）", lambda: (
+    setattr(pet, "sleeping", False), setattr(pet, "state", "idle"),
+    setattr(pet, "_last_painted_state", "sleep"),
+    _count_updates(pet, 1) >= 1 or (_ for _ in ()).throw(
+        AssertionError("姿势变化应触发重绘"))))
+check("主题光晕按尺寸缓存", lambda: (
+    setattr(pet, "_glow_key", None), pet.repaint(),
+    pet._glow is not None and pet._glow_key == (
+        pet.save.get("theme", "樱花粉"), pet.width(), pet.height()) or (
+        _ for _ in ()).throw(AssertionError("光晕缓存键不正确"))))
+check("打气互动", lambda: (
+    setattr(pet, "hop_ticks", 0), pet._cheer(),
+    pet.hop_ticks > 0 or (_ for _ in ()).throw(
+        AssertionError("打气未触发加油动作"))))
+check("深呼吸引导（含防重入）", lambda: (
+    setattr(pet, "_relaxing", False), pet._relax(),
+    pet._relaxing is True or (_ for _ in ()).throw(
+        AssertionError("未进入放松")),
+    pet._relax(),                      # 重入应被忽略
+    pet._relax_done(),
+    pet._relaxing is False or (_ for _ in ()).throw(
+        AssertionError("放松未复位"))))
+check("v2.2 新台词分类齐全", lambda: (
+    all(k in pet.bank.data for k in (
+        "cheer", "relax_in", "relax_hold", "relax_out", "relax_done")) or (
+        _ for _ in ()).throw(AssertionError("缺少新台词分类"))))
+check("气泡跟随角色移动（守卫）", lambda: (
+    setattr(pet, "fullscreen_quiet", False),
+    pet.bubble.hide(), pet.move(500, 400), pet.say("跟随测试一下"),
+    app.processEvents(),
+    pet.move(950, 320), app.processEvents(),   # 靠事件过滤器自动跟随
+    abs((pet.bubble.x() + pet.bubble.width() // 2)
+        - (pet.x() + pet.width() // 2)) <= 6 or (
+        _ for _ in ()).throw(AssertionError("气泡未跟随角色居中")),
+    pet.bubble._on_fade_done()))
+
+
 def report():
     ok = sum(1 for r in results if r[0])
     print("=" * 56)

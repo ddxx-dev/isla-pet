@@ -37,7 +37,8 @@ except Exception:
     _HAS_PIL = False
 
 from PySide6.QtCore import (Qt, QTimer, QPoint, QRect, QUrl, QEasingCurve,
-                            QPropertyAnimation, QAbstractAnimation, QLockFile)
+                            QEvent, QPropertyAnimation, QAbstractAnimation,
+                            QLockFile)
 from PySide6.QtGui import (QAction, QColor, QCursor, QFont, QFontMetrics,
                            QGuiApplication, QIcon, QImage, QPainter,
                            QPainterPath, QPen, QPixmap, QRadialGradient)
@@ -46,7 +47,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QInputDialog, QLabel,
                                QVBoxLayout, QWidget)
 
 APP_NAME = "IslaPet"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 BASE_HEIGHTS = {"小 (200px)": 200, "中 (260px)": 260, "大 (320px)": 320}
 DEFAULT_SIZE = "中 (260px)"
 
@@ -96,8 +97,21 @@ SCARE_CD_TICKS = 60                 # 中键惊吓冷却
 ZOOM_CD_TICKS = 50                  # 滚轮缩放冷却
 BREATH_SPEED = 0.055                # 呼吸相位增量
 BREATH_AMP = 3.0                    # 呼吸起伏幅度 px
+BREATH_SCALE = 0.012                # 呼吸纵向缩放幅度（以脚底为锚点）
 HOP_AMP = 14.0                      # 开心小跳幅度 px
 BLINK_TICKS = 2                     # 眨眼 0.2 秒
+WALK_SPEED = 0.32                   # 行走步态相位增量
+WALK_BOB = 2.2                      # 行走步态上下起伏 px
+WALK_SWAY = 1.3                     # 行走左右轻摆 px
+INITIATIVE_CD = (2400, 4800)        # 主动搭话冷却 tick 范围
+BLINK_CHANCE = 0.03                 # 待机每帧眨眼概率
+WANDER_TALK_CHANCE = 0.35           # 闲逛到位后随口说话概率
+FOLLOW_STOP_DIST = 70               # 跟随：小于此距离视为已到身边
+FOLLOW_MAX_STEP = 12.0              # 跟随：每帧最大位移 px
+FOLLOW_EASE = 0.12                  # 跟随：朝目标逼近比例
+MOOD_SAD = 10                       # 心情低谷阈值（冷色调 / 开口求助）
+MOOD_HIGH = 85                      # 心情高涨阈值
+MOOD_LOW = 25                       # 心情低落阈值
 
 # 公历固定节日（农历节日需要额外历法表，此处只收公历）
 FESTIVALS = {
@@ -239,7 +253,7 @@ class DialogueBank:
 class SpeechBubble(QWidget):
     """圆角台词气泡，显示 4 秒后淡出。"""
 
-    def __init__(self):
+    def __init__(self, anchor=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool |
                          Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -257,6 +271,9 @@ class SpeechBubble(QWidget):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fade.start)
         self._queue = []                     # 排队台词 [(text, anchor_rect), ...]
+        self._anchor = anchor                # 角色窗口：气泡显示期间跟随其移动
+        if anchor is not None:
+            anchor.installEventFilter(self)  # 监听角色 Move/Resize，实时跟随
 
     def popup(self, text, anchor_rect):
         """anchor_rect: 角色的全局矩形，气泡显示在其上方。
@@ -278,6 +295,27 @@ class SpeechBubble(QWidget):
                                Qt.TextWordWrap, text)
         w, h = rect.width() + 28, rect.height() + 22
         self.resize(w, h + 10)  # +10 给小尾巴留空间
+        self._place(anchor_rect)
+        self.setWindowOpacity(1.0)
+        self.show()
+        self.update()
+        # 长内容多给点阅读时间：短句 4 秒起步，每行再加约 1.1 秒，最多 14 秒
+        extra = 1.1 * (max(1, len(text) // 14) - 1)
+        self._timer.start(int(min(BUBBLE_SHOW_MS * 3.5,
+                                  BUBBLE_SHOW_MS + extra * 1000)))
+
+    def eventFilter(self, obj, event):
+        """角色移动/缩放时实时重定位气泡（与角色同帧，消除跟随迟滞）。"""
+        if (self._anchor is not None and obj is self._anchor
+                and self.isVisible()
+                and event.type() in (QEvent.Move, QEvent.Resize)):
+            self._reposition()
+        return False
+
+    def _place(self, anchor_rect):
+        """把气泡放到 anchor_rect 正上方，并夹取到屏幕可见区域内。"""
+        w = self.width()
+        h = self.height() - 10
         x = anchor_rect.center().x() - w // 2
         y = anchor_rect.top() - h - 14
         screen = QGuiApplication.screenAt(anchor_rect.center())
@@ -286,13 +324,13 @@ class SpeechBubble(QWidget):
             x = max(g.left() + 4, min(x, g.right() - w - 4))
             y = max(g.top() + 4, y)
         self.move(x, y)
-        self.setWindowOpacity(1.0)
-        self.show()
-        self.update()
-        # 长内容多给点阅读时间：短句 4 秒起步，每行再加约 1.1 秒，最多 14 秒
-        extra = 1.1 * (max(1, len(text) // 14) - 1)
-        self._timer.start(int(min(BUBBLE_SHOW_MS * 3.5,
-                                  BUBBLE_SHOW_MS + extra * 1000)))
+
+    def _reposition(self):
+        """跟随定时器回调：按角色当前实时位置重定位气泡（闲逛/拖拽时不脱节）。"""
+        if self._anchor is None or not self.isVisible():
+            return
+        a = self._anchor
+        self._place(QRect(a.mapToGlobal(QPoint(0, 0)), a.size()))
 
     def _on_fade_done(self):
         """淡出完毕后播放下一条排队台词。"""
@@ -471,12 +509,16 @@ class IslaPet(QWidget):
         self.frames = {}
         self._apply_size(self.save.get("size_key", DEFAULT_SIZE), first=True)
 
-        self.bubble = SpeechBubble()
+        self.bubble = SpeechBubble(self)
 
         # ---- 状态机 ----
         self.state = "idle"          # 当前显示的姿势
         self.state_until = 0.0       # 临时状态的结束时刻 (ms tick 计数)
         self.breath_phase = 0.0      # 呼吸相位
+        self.walk_phase = 0.0        # 行走步态相位
+        self._glow = None            # 主题光晕渐变缓存
+        self._glow_key = None        # 缓存键 (theme, w, h)
+        self._last_painted_state = None  # 上次重绘的姿势（用于休眠省重绘）
         self.dragging = False
         self.drag_offset = QPoint()
         self.sleeping = False
@@ -499,6 +541,7 @@ class IslaPet(QWidget):
         self.last_chimed_hour = datetime.now().hour
         self.sit_start = datetime.now()
         self.sleep_reminded_day = None
+        self._relaxing = False       # 深呼吸引导进行中（防重入）
 
         # 秒级定时器：番茄钟阶段切换 / 自定义提醒到点
         self.second_timer = QTimer(self)
@@ -515,7 +558,7 @@ class IslaPet(QWidget):
 
         self.hearts = []             # 通用粒子 [x, y, vx, vy, life, type]
         self.hop_ticks = 0           # 投喂/开心时的小跳剩余 tick
-        self.initiative_cd = random.randint(2400, 4800)  # 主动搭话冷却
+        self.initiative_cd = random.randint(*INITIATIVE_CD)  # 主动搭话冷却
         self.mood_decay = 0          # 心情衰减计时
         self._sad_hint_done = False  # 心情低谷求助提示（只提示一次）
         self.fullscreen_quiet = False  # 前台全屏中（免打扰）
@@ -747,7 +790,7 @@ class IslaPet(QWidget):
 
     def _wander_done(self):
         self.wander_cooldown = random.randint(*WANDER_COOLDOWN)
-        if random.random() < 0.35:
+        if random.random() < WANDER_TALK_CHANCE:
             self.say(self.bank.pick("idle_murmur"))
 
     def _toggle_wander(self, on):
@@ -773,9 +816,9 @@ class IslaPet(QWidget):
         ty = c.y() - int(self.height() * 0.55)
         dx, dy = tx - self.x(), ty - self.y()
         dist = math.hypot(dx, dy)
-        if dist < 70:            # 已经在身边了就不动
+        if dist < FOLLOW_STOP_DIST:            # 已经在身边了就不动
             return
-        step = min(12.0, dist * 0.12)   # 越远走越快，上限 12px/帧
+        step = min(FOLLOW_MAX_STEP, dist * FOLLOW_EASE)   # 越远走越快，有上限
         self.facing_left = dx < 0
         g = self._screen_geo()
         nx = int(self.x() + dx / dist * step)
@@ -863,6 +906,8 @@ class IslaPet(QWidget):
     # ---------- 动画心跳 ----------
     def _tick(self):
         self.breath_phase = (self.breath_phase + BREATH_SPEED) % (2 * math.pi)
+        if self._wandering():
+            self.walk_phase = (self.walk_phase + WALK_SPEED) % (2 * math.pi)
         self.idle_ticks += 1
         if self.scare_cd > 0:
             self.scare_cd -= 1
@@ -889,7 +934,7 @@ class IslaPet(QWidget):
                 self._snap_to_taskbar()
             # 待机时随机眨眼
             if not self.sleeping and self.state == "idle" \
-                    and random.random() < 0.03:
+                    and random.random() < BLINK_CHANCE:
                 self.state = "blink"
                 self.temp_state_ticks = BLINK_TICKS  # 眨眼 0.2 秒
             # 跟随鼠标散步优先于自由闲逛
@@ -910,15 +955,23 @@ class IslaPet(QWidget):
                     and not self.bubble.isVisible():
                 self.initiative_cd -= 1
                 if self.initiative_cd <= 0:
-                    self.initiative_cd = random.randint(2400, 4800)
+                    self.initiative_cd = random.randint(*INITIATIVE_CD)
                     key = "initiative"
-                    if self.save.get("mood", 60) >= 85:
+                    if self.save.get("mood", 60) >= MOOD_HIGH:
                         key = random.choice(("initiative", "mood_high"))
-                    elif self.save.get("mood", 60) <= 25:
+                    elif self.save.get("mood", 60) <= MOOD_LOW:
                         key = random.choice(("initiative", "mood_low"))
                     self.say(self.bank.pick(key))
 
-        self.update()
+        # 仅在画面确有变化时重绘：休眠且无动画时保持静帧，省 CPU/GPU。
+        state_changed = self.state != self._last_painted_state
+        animating = bool(self.hearts) or self.hop_ticks > 0 \
+            or self._wandering() or self.dragging \
+            or self.temp_state_ticks > 0 \
+            or (self.state in ("idle", "blink", "tea") and not self.sleeping)
+        if animating or state_changed:
+            self._last_painted_state = self.state
+            self.update()
 
     def _mood_tick(self):
         """约每 15 分钟无互动掉 1 点心情，最低 0；跌到低谷时她会开口求助。"""
@@ -927,10 +980,10 @@ class IslaPet(QWidget):
             self.mood_decay = 0
             self.save["mood"] = max(0, self.save.get("mood", 60) - 1)
         mood = self.save.get("mood", 60)
-        if mood <= 10 and not self._sad_hint_done:
+        if mood <= MOOD_SAD and not self._sad_hint_done:
             self._sad_hint_done = True
             self.say(self.bank.pick("mood_sad_hint"))
-        elif mood > 10 and self._sad_hint_done:
+        elif mood > MOOD_SAD and self._sad_hint_done:
             self._sad_hint_done = False
 
     def _wake(self):
@@ -949,23 +1002,33 @@ class IslaPet(QWidget):
     def paintEvent(self, _):
         mood = self.save.get("mood", 60)
         pm = self.frames.get(self.state)
-        if mood <= 10:                       # 心情跌到低谷：冷色调立绘
+        if mood <= MOOD_SAD:                       # 心情跌到低谷：冷色调立绘
             pm = self.cold_frames.get(self.state) or pm
         if pm is None or pm.isNull():
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.setRenderHint(QPainter.Antialiasing)
-        # 主题氛围光：柔和光晕铺在立绘身后，让换肤立即可见
-        th = THEMES.get(self.save.get("theme", "樱花粉"), THEMES["樱花粉"])
-        glow = QRadialGradient(
-            self.width() / 2, self.height() - 30,
-            max(self.width(), self.height()) * 0.9)
-        glow.setColorAt(0, QColor(*(th["particle"] + (66,))))
-        glow.setColorAt(1, QColor(*(th["particle"] + (0,))))
+        # 主题氛围光：柔和圆形光晕铺在立绘身后，让换肤立即可见。
+        # 半径不超过圆心到最近窗口边的距离，使渐变在边界前就衰减为全透明，
+        # 从而不露出方形色块边界（只留一圈柔和光晕）。渐变按主题/尺寸缓存，
+        # 避免每帧重建。
+        gkey = (self.save.get("theme", "樱花粉"), self.width(), self.height())
+        if self._glow_key != gkey:
+            th = THEMES.get(gkey[0], THEMES["樱花粉"])
+            cx = self.width() / 2
+            cy = self.height() * 0.52
+            rad = max(1.0, min(cx, cy, self.width() - cx,
+                               self.height() - cy) * 0.98)
+            glow = QRadialGradient(cx, cy, rad)
+            glow.setColorAt(0, QColor(*(th["particle"] + (58,))))
+            glow.setColorAt(0.55, QColor(*(th["particle"] + (22,))))
+            glow.setColorAt(1, QColor(*(th["particle"] + (0,))))
+            self._glow = glow
+            self._glow_key = gkey
         p.save()
         p.setPen(Qt.NoPen)
-        p.setBrush(glow)
+        p.setBrush(self._glow)
         p.drawRect(self.rect())
         p.restore()
         if self.hearts:
@@ -974,13 +1037,25 @@ class IslaPet(QWidget):
         if self.facing_left:  # 朝移动方向镜像
             p.translate(self.width(), 0)
             p.scale(-1, 1)
-        # 呼吸：轻微上下浮动 + 极轻微纵向缩放
+        # 呼吸：轻微上下浮动 + 纵向缩放（以脚底为锚点）；
+        # 移动时改为行走步态（上下起伏 + 左右轻摆），让移动像"走"而不是"飘"。
         dy = 0.0
-        if self.state in ("idle", "blink", "tea") and not self.dragging:
-            dy = BREATH_AMP * (1 + math.sin(self.breath_phase)) / 2
+        sy = 1.0
+        sway = 0.0
+        if self._wandering():
+            dy = WALK_BOB * abs(math.sin(self.walk_phase))
+            sway = WALK_SWAY * math.sin(self.walk_phase)
+        elif self.state in ("idle", "blink", "tea") and not self.dragging:
+            s = math.sin(self.breath_phase)
+            dy = BREATH_AMP * (1 + s) / 2
+            sy = 1.0 + BREATH_SCALE * s
         if self.hop_ticks > 0:      # 开心时的小跳（半个正弦弧）
             dy -= HOP_AMP * math.sin(math.pi * (self.hop_ticks % 8) / 8)
-        x = (self.width() - pm.width()) // 2
+        if sy != 1.0:               # 以脚底为锚点做纵向缩放，脚不离地
+            p.translate(0, self.height())
+            p.scale(1, sy)
+            p.translate(0, -self.height())
+        x = (self.width() - pm.width()) // 2 + int(round(sway))
         y = self.height() - pm.height() + int(round(dy)) - 4
         p.drawPixmap(x, y, pm)
         p.restore()
@@ -1291,6 +1366,7 @@ class IslaPet(QWidget):
         play.addAction("掷骰子", self._roll_dice)
         play.addAction("抛硬币", self._flip_coin)
         play.addAction("跳舞", self._dance)
+        play.addAction("给我打打气", self._cheer)
         play.addAction("放烟花", self._show_firework)
         rps = play.addMenu("猜拳")
         for i, name in enumerate(RPS):
@@ -1333,6 +1409,7 @@ class IslaPet(QWidget):
         tools.addAction("查看待办（%d）" % len(self.reminders),
                         self._show_reminders)
         tools.addAction("看看电脑状态", self._pc_status)
+        tools.addAction("陪我深呼吸", self._relax)
         tools.addAction("读今日热点", lambda: self._daily_brief(True))
         tools.addSeparator()
         tools.addAction("今日运势", self._fortune)
@@ -1885,6 +1962,30 @@ class IslaPet(QWidget):
                 self.bank.pick("reminder_fire", text=s)))
             if i == 0:
                 self._notify("提醒", txt)
+
+    # ---------- 打气 / 深呼吸（v2.2 新增互动） ----------
+    def _cheer(self):
+        """给你打打气：一句鼓励 + 一个加油的小动作。"""
+        self.hop_ticks = 12
+        self._spawn_hearts(6)
+        self.say(self.bank.pick("cheer"))
+        self.add_affection(1)
+
+    def _relax(self):
+        """陪你做一轮 4-4-4 深呼吸：吸气-屏息-呼气，节奏提示。"""
+        if self._relaxing:
+            return
+        self._relaxing = True
+        self._stop_wander()
+        self.say(self.bank.pick("relax_in"))
+        QTimer.singleShot(4000, lambda: self.say(self.bank.pick("relax_hold")))
+        QTimer.singleShot(8000, lambda: self.say(self.bank.pick("relax_out")))
+        QTimer.singleShot(12000, self._relax_done)
+
+    def _relax_done(self):
+        self._relaxing = False
+        self.say(self.bank.pick("relax_done"))
+        self.add_affection(1)
 
     def _pc_status(self):
         pct = self._memory_percent()
