@@ -275,9 +275,14 @@ class SpeechBubble(QWidget):
         if anchor is not None:
             anchor.installEventFilter(self)  # 监听角色 Move/Resize，实时跟随
 
-    def popup(self, text, anchor_rect):
+    def popup(self, text, anchor_rect, interrupt=False):
         """anchor_rect: 角色的全局矩形，气泡显示在其上方。
-        正在显示时新台词进入队列，淡出完毕后依次播放，避免互相覆盖。"""
+        正在显示时新台词进入队列，淡出完毕后依次播放，避免互相覆盖。
+        interrupt=True 时清空队列并立即插播（用于用户主动互动，不等旧台词）。"""
+        if interrupt:
+            self._queue.clear()
+            self._show(text, anchor_rect)
+            return
         if self.isVisible():
             if len(self._queue) < BUBBLE_QUEUE_MAX:
                 self._queue.append((text, anchor_rect))
@@ -742,6 +747,15 @@ class IslaPet(QWidget):
             self.move(g.right() - self.width() - 24,
                       g.bottom() - self.height() + 1)
 
+    def _ground_now(self):
+        """立即结束在途的落回/归位动画，让她瞬间站稳（用户主动互动时先落地）。"""
+        anim = self.drop_anim
+        if anim is not None and anim.state() == QAbstractAnimation.Running:
+            end = anim.endValue()
+            anim.stop()
+            if isinstance(end, QPoint):
+                self.move(end)
+
     def _snap_to_taskbar(self):
         """松手后落回任务栏上沿（可用区域底部）。"""
         g = self._screen_geo()
@@ -811,9 +825,9 @@ class IslaPet(QWidget):
         self.save["follow_on"] = on
         if on:
             self._stop_wander()
-            self.say(self.bank.pick("follow_on"))
+            self.say(self.bank.pick("follow_on"), interrupt=True)
         else:
-            self.say(self.bank.pick("follow_off"))
+            self.say(self.bank.pick("follow_off"), interrupt=True)
 
     def _follow_step(self):
         """每帧朝鼠标缓慢靠近，保持一段距离站在旁边。"""
@@ -1068,14 +1082,17 @@ class IslaPet(QWidget):
         p.restore()
 
     # ---------- 台词 ----------
-    def say(self, text, force=False):
-        """弹出台词气泡。全屏免打扰时改为托盘通知（force=True 可强制弹窗）。"""
+    def say(self, text, force=False, interrupt=False):
+        """弹出台词气泡。全屏免打扰时改为托盘通知（force=True 可强制弹窗）。
+        interrupt=True 用于用户主动互动：让她立即落地、清空排队并马上插播。"""
         if self.fullscreen_quiet and not force:
             self._notify("艾拉", text)
             return
+        if interrupt:
+            self._ground_now()
         self.bubble.theme = self.save.get("theme", "樱花粉")
         r = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
-        self.bubble.popup(text, r)
+        self.bubble.popup(text, r, interrupt=interrupt)
 
     @staticmethod
     def _is_foreground_fullscreen():
@@ -1120,7 +1137,7 @@ class IslaPet(QWidget):
             key = "greeting_afternoon"
         else:
             key = "greeting_evening"
-        self.say(self.bank.pick(key))
+        self.say(self.bank.pick(key), interrupt=True)
 
     # ---------- 每日陪伴：登录天数 / 节日 / 纪念日 ----------
     def _check_login_streak(self):
@@ -1309,7 +1326,7 @@ class IslaPet(QWidget):
             self.dragging = True
             self.click_timer.stop()
             self.state = "panic"
-            self.say(self.bank.pick("drag"))
+            self.say(self.bank.pick("drag"), interrupt=True)
         if self.dragging:
             self.move(gp - self.drag_offset)
 
@@ -1323,7 +1340,7 @@ class IslaPet(QWidget):
                 self._settle_in_screen()  # 闲逛模式：放哪待哪
             else:
                 self._snap_to_taskbar()
-            self.say(self.bank.pick("drop"))
+            self.say(self.bank.pick("drop"), interrupt=True)
             self.add_affection(1)
         else:
             # 等待可能的第二次点击（双击）
@@ -1337,7 +1354,7 @@ class IslaPet(QWidget):
         self._wake()
         self._set_temp_state("panic", 1.2)
         QTimer.singleShot(1200, lambda: self._set_temp_state("shy", 2.0))
-        self.say(self.bank.pick("double_click"))
+        self.say(self.bank.pick("double_click"), interrupt=True)
         self._spawn_hearts(4)
         self.add_affection(3)
 
@@ -1348,13 +1365,13 @@ class IslaPet(QWidget):
             self._set_temp_state("shy", 2.4)
             self._spawn_hearts(7)
             self.hop_ticks = 8
-            self.say(self.bank.pick("head_pat"))
+            self.say(self.bank.pick("head_pat"), interrupt=True)
             self.add_affection(2)
             self._bump("pat")
             self._record_memory("pat_1", "memory_first_pat")
         else:
             self._set_temp_state("shy", 2.0)
-            self.say(self.bank.pick("click_shy"))
+            self.say(self.bank.pick("click_shy"), interrupt=True)
             self.add_affection(1)
             self._bump("click")
 
@@ -1494,7 +1511,7 @@ class IslaPet(QWidget):
     # ---------- 互动玩法 ----------
     def _brew_tea(self):
         self._set_temp_state("tea", 4.0)
-        self.say(self.bank.pick("tea"))
+        self.say(self.bank.pick("tea"), interrupt=True)
         self.add_affection(2)
         self._bump("tea")
         self._record_memory("tea_1", "memory_first_tea")
@@ -1503,7 +1520,7 @@ class IslaPet(QWidget):
         self._set_temp_state("shy", 3.0)
         self.hop_ticks = 16          # 连蹦两下
         self._spawn_hearts(5)
-        self.say(self.bank.pick("feed"))
+        self.say(self.bank.pick("feed"), interrupt=True)
         self.add_affection(3)
         self._bump("feed")
         self._record_memory("feed_1", "memory_first_feed")
@@ -1518,7 +1535,7 @@ class IslaPet(QWidget):
         else:
             key = "rps_win"            # 她赢
         self._set_temp_state("panic", 1.0)
-        self.say("我出……%s！" % RPS[hers])
+        self.say("我出……%s！" % RPS[hers], interrupt=True)
         QTimer.singleShot(1400, lambda: self._rps_result(key))
         self.add_affection(1)
 
@@ -1529,7 +1546,7 @@ class IslaPet(QWidget):
             self._spawn_hearts(4)
         else:
             self._set_temp_state("shy", 2.2)
-        self.say(self.bank.pick(key))
+        self.say(self.bank.pick(key), interrupt=True)
         self._bump(key)
         if key == "rps_win":
             self._record_memory("rps_win_1", "memory_first_rps_win")
@@ -1548,7 +1565,7 @@ class IslaPet(QWidget):
             key = "dice_low"
         else:
             key = "dice_mid"
-        self.say(self.bank.pick(key, num=n))
+        self.say(self.bank.pick(key, num=n), interrupt=True)
         QTimer.singleShot(1300, lambda: self._set_temp_state("idle", 0.4))
 
     def _flip_coin(self):
@@ -1556,14 +1573,14 @@ class IslaPet(QWidget):
         head = random.random() < 0.5
         self._bump("coin")
         self._set_temp_state("panic", 1.0)
-        self.say("抛……！")
+        self.say("抛……！", interrupt=True)
         QTimer.singleShot(1200, lambda: self._coin_result(head))
 
     def _coin_result(self, head):
         self._set_temp_state("shy", 1.8)
         side = "正" if head else "反"
         key = "coin_head" if head else "coin_tail"
-        self.say(self.bank.pick(key, side=side))
+        self.say(self.bank.pick(key, side=side), interrupt=True)
 
     def _dance(self):
         """跳舞：随机姿势序列 4 秒 + 星星音符粒子。"""
@@ -1571,7 +1588,7 @@ class IslaPet(QWidget):
         self._record_memory("dance_1", "memory_first_dance")
         self.dance_seq = random.sample(
             ["tea", "shy", "panic", "blink", "idle"], k=4)
-        self.say(self.bank.pick("dance"))
+        self.say(self.bank.pick("dance"), interrupt=True)
         self._dance_step()
         self._spawn_particles(8, "star", vy=(-1.4, -0.5), life=(12, 20))
         self.dance_timer.start(500)
@@ -1587,7 +1604,7 @@ class IslaPet(QWidget):
         self._bump("scare")
         self._set_temp_state("panic", 1.6)
         self.hop_ticks = 10
-        self.say(self.bank.pick("scare"))
+        self.say(self.bank.pick("scare"), interrupt=True)
         self.scare_cd = SCARE_CD_TICKS
 
     def wheelEvent(self, e):
@@ -1602,10 +1619,10 @@ class IslaPet(QWidget):
             else sizes.index(DEFAULT_SIZE)
         if e.angleDelta().y() > 0:
             nxt = min(len(sizes) - 1, cur + 1)
-            self.say(self.bank.pick("zoom_up"))
+            self.say(self.bank.pick("zoom_up"), interrupt=True)
         else:
             nxt = max(0, cur - 1)
-            self.say(self.bank.pick("zoom_down"))
+            self.say(self.bank.pick("zoom_down"), interrupt=True)
         self._apply_size(sizes[nxt])
         e.accept()
 
@@ -1656,7 +1673,7 @@ class IslaPet(QWidget):
     def _view_memories(self):
         mem = self.save.get("memories") or {}
         if not mem:
-            self.say(self.bank.pick("memory_none"))
+            self.say(self.bank.pick("memory_none"), interrupt=True)
             return
         names = dict((aid, name) for aid, name, _d, _c in _def_achievements())
         lines = ["%s · %s" % (day, names.get(key, key))
@@ -1746,7 +1763,7 @@ class IslaPet(QWidget):
             self.save["fortune"] = [today, rank, key]
         self._bump("fortune")
         self._record_memory("fortune_1", "memory_first_fortune")
-        self.say(self.bank.pick(key, rank=rank))
+        self.say(self.bank.pick(key, rank=rank), interrupt=True)
         self.save_data()
 
     # ---------- 闹钟 ----------
@@ -1786,7 +1803,7 @@ class IslaPet(QWidget):
     # ---------- 主题换肤 ----------
     def _set_theme(self, name):
         self.save["theme"] = name
-        self.say(self.bank.pick("theme_change", name=name))
+        self.say(self.bank.pick("theme_change", name=name), interrupt=True)
         self.bubble.update()                       # 正在显示的气泡立即换色
         self._spawn_particles(8, "star", vy=(-1.3, -0.5),
                               life=(14, 26))       # 撒一撮新主题色星星，立即可见
@@ -1856,10 +1873,10 @@ class IslaPet(QWidget):
             return
         if on:
             self.noise.play()
-            self.say(self.bank.pick("noise_on"))
+            self.say(self.bank.pick("noise_on"), interrupt=True)
         else:
             self.noise.stop()
-            self.say(self.bank.pick("noise_off"))
+            self.say(self.bank.pick("noise_off"), interrupt=True)
         self.save_data()
 
     def _restore_noise(self):
@@ -1887,7 +1904,7 @@ class IslaPet(QWidget):
         screen = QGuiApplication.screenAt(self.geometry().center()) \
             or QGuiApplication.primaryScreen()
         self.firework.launch(geo=screen.geometry())
-        self.say(self.bank.pick("firework"))
+        self.say(self.bank.pick("firework"), interrupt=True)
 
     # ---------- 托盘通知 ----------
     def _notify(self, title, body):
@@ -1912,14 +1929,14 @@ class IslaPet(QWidget):
         self.pomo_state = phase
         self.pomo_end = datetime.now() + timedelta(minutes=mins)
         if phase == "focus":
-            self.say(self.bank.pick("pomodoro_start", minutes=mins))
+            self.say(self.bank.pick("pomodoro_start", minutes=mins), interrupt=True)
             self._set_temp_state("tea", 2.5)
         self.add_affection(1)
 
     def _pomo_stop(self):
         self.pomo_state = None
         self.pomo_end = None
-        self.say(self.bank.pick("pomodoro_stop"))
+        self.say(self.bank.pick("pomodoro_stop"), interrupt=True)
 
     def _pomo_check(self):
         if not self.pomo_state or datetime.now() < self.pomo_end:
@@ -1947,12 +1964,12 @@ class IslaPet(QWidget):
             return
         self.reminders.append(
             (datetime.now() + timedelta(minutes=mins), text.strip()))
-        self.say(self.bank.pick("reminder_set", minutes=mins))
+        self.say(self.bank.pick("reminder_set", minutes=mins), interrupt=True)
         self.add_affection(1)
 
     def _show_reminders(self):
         if not self.reminders:
-            self.say(self.bank.pick("reminder_none"))
+            self.say(self.bank.pick("reminder_none"), interrupt=True)
             return
         items = ["%s · %s" % (t.strftime("%H:%M"), txt)
                  for t, txt in sorted(self.reminders)]
@@ -1975,7 +1992,7 @@ class IslaPet(QWidget):
         """给你打打气：一句鼓励 + 一个加油的小动作。"""
         self.hop_ticks = 12
         self._spawn_hearts(6)
-        self.say(self.bank.pick("cheer"))
+        self.say(self.bank.pick("cheer"), interrupt=True)
         self.add_affection(1)
 
     def _relax(self):
@@ -1984,20 +2001,20 @@ class IslaPet(QWidget):
             return
         self._relaxing = True
         self._stop_wander()
-        self.say(self.bank.pick("relax_in"))
-        QTimer.singleShot(4000, lambda: self.say(self.bank.pick("relax_hold")))
-        QTimer.singleShot(8000, lambda: self.say(self.bank.pick("relax_out")))
+        self.say(self.bank.pick("relax_in"), interrupt=True)
+        QTimer.singleShot(4000, lambda: self.say(self.bank.pick("relax_hold"), interrupt=True))
+        QTimer.singleShot(8000, lambda: self.say(self.bank.pick("relax_out"), interrupt=True))
         QTimer.singleShot(12000, self._relax_done)
 
     def _relax_done(self):
         self._relaxing = False
-        self.say(self.bank.pick("relax_done"))
+        self.say(self.bank.pick("relax_done"), interrupt=True)
         self.add_affection(1)
 
     def _pc_status(self):
         pct = self._memory_percent()
         key = "pc_status_busy" if pct >= 75 else "pc_status_ok"
-        self.say(self.bank.pick(key, mem=pct))
+        self.say(self.bank.pick(key, mem=pct), interrupt=True)
 
     @staticmethod
     def _memory_percent():
@@ -2082,7 +2099,7 @@ class IslaPet(QWidget):
         self.say("好的……专注 %d 分钟，休息 %d 分钟。" % (focus, brk))
 
     def _quit(self):
-        self.say(self.bank.pick("farewell"))
+        self.say(self.bank.pick("farewell"), interrupt=True)
         self.save_data()
         QTimer.singleShot(900, QApplication.quit)
 

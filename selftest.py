@@ -468,6 +468,13 @@ check("气泡用实时定位（排队回放不脱节）", lambda: (
         - (pet.x() + pet.width() // 2)) <= 6 or (
         _ for _ in ()).throw(AssertionError("气泡未采用角色实时位置")),
     pet.bubble._on_fade_done()))
+check("用户互动打断排队（守卫）", lambda: (
+    pet.bubble.hide(), pet.say("排队A"), app.processEvents(),
+    pet.say("排队B"), app.processEvents(),
+    pet.say("打断C", interrupt=True), app.processEvents(),
+    (len(pet.bubble._queue) == 0 and "打断C" in pet.bubble._text) or (
+        _ for _ in ()).throw(AssertionError("打断未清队列或未立即插播")),
+    pet.bubble._on_fade_done()))
 
 
 def report():
