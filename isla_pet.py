@@ -103,6 +103,8 @@ BLINK_TICKS = 2                     # 眨眼 0.2 秒
 WALK_SPEED = 0.32                   # 行走步态相位增量
 WALK_BOB = 2.2                      # 行走步态上下起伏 px
 WALK_SWAY = 1.3                     # 行走左右轻摆 px
+ENTRANCE_MS = 900                   # 开机出场动画时长
+ENTRANCE_START_SCALE = 0.35         # 出场起始缩放（从脚底放大登场）
 INITIATIVE_CD = (2400, 4800)        # 主动搭话冷却 tick 范围
 BLINK_CHANCE = 0.03                 # 待机每帧眨眼概率
 WANDER_TALK_CHANCE = 0.35           # 闲逛到位后随口说话概率
@@ -531,6 +533,9 @@ class IslaPet(QWidget):
         self._glow = None            # 主题光晕渐变缓存
         self._glow_key = None        # 缓存键 (theme, w, h)
         self._last_painted_state = None  # 上次重绘的姿势（用于休眠省重绘）
+        self._ent_scale = 1.0        # 出场动画缩放（1.0=无出场）
+        self._ent_start = 0.0        # 出场动画起始时刻
+        self._ent_timer = None       # 出场动画驱动器
         self.dragging = False
         self.drag_offset = QPoint()
         self.sleeping = False
@@ -615,8 +620,9 @@ class IslaPet(QWidget):
         self._check_login_streak()
 
         self._place_initial()
+        self.setWindowOpacity(0.0)   # 先透明，避免出场动画前闪现
         self.show()
-        QTimer.singleShot(600, self._greet)
+        self._play_entrance()        # 开机出场动画，结束后自动打招呼
         QTimer.singleShot(5200, self._daily_notes)
         QTimer.singleShot(17000, self._brief_maybe_auto)
 
@@ -746,6 +752,32 @@ class IslaPet(QWidget):
             # 默认右下角，站在任务栏上沿
             self.move(g.right() - self.width() - 24,
                       g.bottom() - self.height() + 1)
+
+    def _play_entrance(self):
+        """开机出场动画：从脚底放大 + 淡入"登场"，落定后撒爱心再打招呼。"""
+        self._ent_scale = ENTRANCE_START_SCALE
+        self.setWindowOpacity(0.0)
+        self._ent_start = time.monotonic()
+        if self._ent_timer is None:
+            self._ent_timer = QTimer(self)
+            self._ent_timer.setInterval(16)          # ~60fps
+            self._ent_timer.timeout.connect(self._entrance_step)
+        self._ent_timer.start()
+
+    def _entrance_step(self):
+        t = (time.monotonic() - self._ent_start) * 1000.0 / ENTRANCE_MS
+        if t >= 1.0:
+            self._ent_timer.stop()
+            self._ent_scale = 1.0
+            self.setWindowOpacity(1.0)
+            self.update()
+            self._spawn_hearts(8)                    # 登场小彩蛋
+            self._greet()
+            return
+        e = 1 - (1 - t) ** 3                          # easeOutCubic
+        self._ent_scale = ENTRANCE_START_SCALE + (1 - ENTRANCE_START_SCALE) * e
+        self.setWindowOpacity(min(1.0, t * 1.4))      # 淡入略快于缩放
+        self.update()
 
     def _ground_now(self):
         """立即结束在途的落回/归位动画，让她瞬间站稳（用户主动互动时先落地）。"""
@@ -1055,6 +1087,12 @@ class IslaPet(QWidget):
         if self.hearts:
             self._paint_hearts(p)
         p.save()
+        if self._ent_scale < 1.0:      # 出场动画：以脚底为锚点整体缩放登场
+            cx = self.width() / 2.0
+            by = float(self.height())
+            p.translate(cx, by)
+            p.scale(self._ent_scale, self._ent_scale)
+            p.translate(-cx, -by)
         if self.facing_left:  # 朝移动方向镜像
             p.translate(self.width(), 0)
             p.scale(-1, 1)

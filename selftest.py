@@ -475,6 +475,17 @@ check("用户互动打断排队（守卫）", lambda: (
     (len(pet.bubble._queue) == 0 and "打断C" in pet.bubble._text) or (
         _ for _ in ()).throw(AssertionError("打断未清队列或未立即插播")),
     pet.bubble._on_fade_done()))
+check("开机出场动画（守卫）", lambda: (
+    pet._play_entrance(),
+    pet._ent_scale < 0.5 or (_ for _ in ()).throw(
+        AssertionError("出场起始缩放应很小")),
+    pet.windowOpacity() < 0.05 or (_ for _ in ()).throw(
+        AssertionError("出场应从透明开始")),
+    setattr(pet, "_ent_start", __import__("time").monotonic() - 5),
+    pet._entrance_step(),
+    (pet._ent_scale > 0.99 and pet.windowOpacity() > 0.99
+     and not pet._ent_timer.isActive()) or (_ for _ in ()).throw(
+        AssertionError("出场结束未复位到原大小/不透明"))))
 
 
 def report():
