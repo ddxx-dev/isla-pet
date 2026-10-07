@@ -103,8 +103,8 @@ BLINK_TICKS = 2                     # 眨眼 0.2 秒
 WALK_SPEED = 0.32                   # 行走步态相位增量
 WALK_BOB = 2.2                      # 行走步态上下起伏 px
 WALK_SWAY = 1.3                     # 行走左右轻摆 px
-ENTRANCE_MS = 900                   # 开机出场动画时长
-ENTRANCE_START_SCALE = 0.35         # 出场起始缩放（从脚底放大登场）
+ENTRANCE_MS = 1200                  # 开机出场动画时长
+ENTRANCE_START_SCALE = 0.28         # 出场起始缩放（从脚底放大登场）
 INITIATIVE_CD = (2400, 4800)        # 主动搭话冷却 tick 范围
 BLINK_CHANCE = 0.03                 # 待机每帧眨眼概率
 WANDER_TALK_CHANCE = 0.35           # 闲逛到位后随口说话概率
@@ -771,12 +771,17 @@ class IslaPet(QWidget):
             self._ent_scale = 1.0
             self.setWindowOpacity(1.0)
             self.update()
-            self._spawn_hearts(8)                    # 登场小彩蛋
-            self._greet()
+            self._spawn_hearts(6)                      # 登场小彩蛋
+            self._spawn_particles(10, "spark")
+            self.say(self.bank.pick("entrance"), interrupt=True)
             return
-        e = 1 - (1 - t) ** 3                          # easeOutCubic
-        self._ent_scale = ENTRANCE_START_SCALE + (1 - ENTRANCE_START_SCALE) * e
-        self.setWindowOpacity(min(1.0, t * 1.4))      # 淡入略快于缩放
+        # 缩放用轻微回弹 easeOutBack，登场有"啵"的一下；淡入用 easeOutCubic
+        c1 = 0.9
+        c3 = c1 + 1
+        p1 = t - 1.0
+        back = 1 + c3 * p1 ** 3 + c1 * p1 ** 2
+        self._ent_scale = ENTRANCE_START_SCALE + (1 - ENTRANCE_START_SCALE) * back
+        self.setWindowOpacity(min(1.0, t * 1.4))       # 淡入略快于缩放
         self.update()
 
     def _ground_now(self):
@@ -1014,6 +1019,9 @@ class IslaPet(QWidget):
                         key = random.choice(("initiative", "mood_high"))
                     elif self.save.get("mood", 60) <= MOOD_LOW:
                         key = random.choice(("initiative", "mood_low"))
+                    elif random.random() < 0.2:
+                        # 心情平稳时，偶尔聊聊她作为 Giftia 的身世与羁绊（原作致敬）
+                        key = random.choice(("origin", "bond"))
                     self.say(self.bank.pick(key))
 
         # 仅在画面确有变化时重绘：休眠且无动画时保持静帧，省 CPU/GPU。
