@@ -105,6 +105,8 @@ WALK_BOB = 2.2                      # 行走步态上下起伏 px
 WALK_SWAY = 1.3                     # 行走左右轻摆 px
 ENTRANCE_MS = 1200                  # 开机出场动画时长
 ENTRANCE_START_SCALE = 0.28         # 出场起始缩放（从脚底放大登场）
+RELAX_PHASE_MS = 4000
+MAX_PARTICLES = 120
 INITIATIVE_CD = (2400, 4800)        # 主动搭话冷却 tick 范围
 BLINK_CHANCE = 0.03                 # 待机每帧眨眼概率
 WANDER_TALK_CHANCE = 0.35           # 闲逛到位后随口说话概率
@@ -346,12 +348,22 @@ class SpeechBubble(QWidget):
             return
         self._place()
 
-    def _on_fade_done(self):
-        """淡出完毕后播放下一条排队台词。"""
+    def dismiss(self):
+        self._queue.clear()
         self.hide()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        self._fade.stop()
+        self._queue.clear()
+        super().hideEvent(event)
+
+    def _on_fade_done(self):
         if self._queue:
             text, rect = self._queue.pop(0)
             self._show(text, rect)
+        else:
+            self.hide()
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -389,23 +401,36 @@ class FireworkOverlay(QWidget):
         self._timer.timeout.connect(self._step)
         self._launcher = QTimer(self)
         self._launcher.setInterval(380)
-        self._launcher.timeout.connect(self._burst)
+        self._launcher.timeout.connect(self._launch_wave)
+        self._waves_left = 0
 
     def launch(self, waves=3, geo=None):
-        """geo: 烟花所在屏幕的完整几何（多显示器时跟随宠物所在屏）。"""
+        self._launcher.stop()
+        self._timer.stop()
+        self.particles.clear()
+        self._waves_left = max(1, waves)
         self.setGeometry(geo or QGuiApplication.primaryScreen().virtualGeometry())
+        self._launch_wave()
         self.show()
         self.raise_()
-        self.particles.clear()
+        if self._waves_left:
+            self._launcher.start()
+        self._timer.start()
+
+    def _launch_wave(self):
         self._burst()
-        self._launcher.start()
-        QTimer.singleShot(380 * waves + 900, self._launcher.stop)
-        QTimer.singleShot(380 * waves + 2600, self._check_finish)
-        if not self._timer.isActive():
-            self._timer.start()
+        self._waves_left -= 1
+        if self._waves_left <= 0:
+            self._launcher.stop()
+
+    def hideEvent(self, event):
+        self._launcher.stop()
+        self._timer.stop()
+        self.particles.clear()
+        super().hideEvent(event)
 
     def _burst(self):
-        g = self.geometry()
+        g = self.rect()
         x = random.uniform(g.left() + 80, g.right() - 80)
         y = random.uniform(g.top() + 80, g.bottom() - 80)
         color = random.choice([
@@ -429,17 +454,16 @@ class FireworkOverlay(QWidget):
             if p[4] > 0:
                 alive.append(p)
         self.particles = alive
+        self._check_finish()
         self.update()
 
     def _check_finish(self):
-        if not self.particles:
+        if not self.particles and not self._launcher.isActive():
             self.hide()
             self._timer.stop()
 
     def paintEvent(self, _):
         if not self.particles:
-            self.hide()
-            self._timer.stop()
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -536,6 +560,7 @@ class IslaPet(QWidget):
         self._ent_scale = 1.0        # 出场动画缩放（1.0=无出场）
         self._ent_start = 0.0        # 出场动画起始时刻
         self._ent_timer = None       # 出场动画驱动器
+        self._interaction_timers = set()
         self.dragging = False
         self.drag_offset = QPoint()
         self.sleeping = False
@@ -623,7 +648,7 @@ class IslaPet(QWidget):
         self.setWindowOpacity(0.0)   # 先透明，避免出场动画前闪现
         self.show()
         self._play_entrance()        # 开机出场动画，结束后自动打招呼
-        QTimer.singleShot(5200, self._daily_notes)
+        self._schedule_interaction(5200, self._daily_notes)
         QTimer.singleShot(17000, self._brief_maybe_auto)
 
     # ---------- 存档 ----------
@@ -765,6 +790,8 @@ class IslaPet(QWidget):
         self._ent_timer.start()
 
     def _entrance_step(self):
+        if self._ent_timer is None or not self._ent_timer.isActive():
+            return
         t = (time.monotonic() - self._ent_start) * 1000.0 / ENTRANCE_MS
         if t >= 1.0:
             self._ent_timer.stop()
@@ -784,8 +811,56 @@ class IslaPet(QWidget):
         self.setWindowOpacity(min(1.0, t * 1.4))       # 淡入略快于缩放
         self.update()
 
+    def _schedule_interaction(self, delay_ms, callback):
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def fire():
+            self._interaction_timers.discard(timer)
+            timer.deleteLater()
+            callback()
+
+        timer.timeout.connect(fire)
+        self._interaction_timers.add(timer)
+        timer.start(delay_ms)
+
+    def _cancel_interaction(self):
+        for timer in self._interaction_timers:
+            timer.stop()
+            timer.deleteLater()
+        self._interaction_timers.clear()
+        self.click_timer.stop()
+        self.dance_timer.stop()
+        self.dance_seq.clear()
+        self._relaxing = False
+        if self._ent_timer is not None:
+            self._ent_timer.stop()
+        self._ent_scale = 1.0
+        self.setWindowOpacity(1.0)
+        self._stop_wander()
+        if self.firework is not None:
+            self.firework.hide()
+
+    def _begin_interaction(self):
+        self._cancel_interaction()
+        self._ground_now()
+        self.sleeping = False
+        self.idle_ticks = 0
+        self.state = "idle"
+        self.temp_state_ticks = 0
+        self.hop_ticks = 0
+        self.hearts.clear()
+        self.bubble.dismiss()
+        self.update()
+
+    def hideEvent(self, event):
+        self._cancel_interaction()
+        if self.drop_anim is not None:
+            self.drop_anim.stop()
+        self.bubble.dismiss()
+        super().hideEvent(event)
+
     def _ground_now(self):
-        """立即结束在途的落回/归位动画，让她瞬间站稳（用户主动互动时先落地）。"""
         anim = self.drop_anim
         if anim is not None and anim.state() == QAbstractAnimation.Running:
             end = anim.endValue()
@@ -903,6 +978,8 @@ class IslaPet(QWidget):
                 random.randint(*life),
                 ptype,
             ])
+        if len(self.hearts) > MAX_PARTICLES:   # 防止刷屏时粒子无限堆积
+            self.hearts = self.hearts[-MAX_PARTICLES:]
 
     def _update_hearts(self):
         for h in self.hearts:
@@ -966,6 +1043,7 @@ class IslaPet(QWidget):
         self.breath_phase = (self.breath_phase + BREATH_SPEED) % (2 * math.pi)
         if self._wandering():
             self.walk_phase = (self.walk_phase + WALK_SPEED) % (2 * math.pi)
+        had_effects = bool(self.hearts) or self.hop_ticks > 0
         self.idle_ticks += 1
         if self.scare_cd > 0:
             self.scare_cd -= 1
@@ -982,7 +1060,10 @@ class IslaPet(QWidget):
             if self.temp_state_ticks == 0 and not self.dragging:
                 self.state = "sleep" if self.sleeping else "idle"
 
-        if not self.dragging and self.temp_state_ticks == 0:
+        if (not self.dragging and self.temp_state_ticks == 0
+                and self.isVisible() and not self.fullscreen_quiet
+                and not self._relaxing and not self.dance_timer.isActive()
+                and not (self._ent_timer and self._ent_timer.isActive())):
             # 长时间无操作（3 分钟）-> 回到任务栏上沿坐下打瞌睡
             if not self.sleeping and self.idle_ticks >= SLEEP_AFTER_TICKS \
                     and not self.save.get("follow_on"):
@@ -1024,13 +1105,12 @@ class IslaPet(QWidget):
                         key = random.choice(("origin", "bond"))
                     self.say(self.bank.pick(key))
 
-        # 仅在画面确有变化时重绘：休眠且无动画时保持静帧，省 CPU/GPU。
         state_changed = self.state != self._last_painted_state
-        animating = bool(self.hearts) or self.hop_ticks > 0 \
+        animating = had_effects or bool(self.hearts) or self.hop_ticks > 0 \
             or self._wandering() or self.dragging \
             or self.temp_state_ticks > 0 \
             or (self.state in ("idle", "blink", "tea") and not self.sleeping)
-        if animating or state_changed:
+        if self.isVisible() and (animating or state_changed):
             self._last_painted_state = self.state
             self.update()
 
@@ -1095,7 +1175,7 @@ class IslaPet(QWidget):
         if self.hearts:
             self._paint_hearts(p)
         p.save()
-        if self._ent_scale < 1.0:      # 出场动画：以脚底为锚点整体缩放登场
+        if self._ent_scale != 1.0:
             cx = self.width() / 2.0
             by = float(self.height())
             p.translate(cx, by)
@@ -1129,13 +1209,10 @@ class IslaPet(QWidget):
 
     # ---------- 台词 ----------
     def say(self, text, force=False, interrupt=False):
-        """弹出台词气泡。全屏免打扰时改为托盘通知（force=True 可强制弹窗）。
-        interrupt=True 用于用户主动互动：让她立即落地、清空排队并马上插播。"""
-        if self.fullscreen_quiet and not force:
-            self._notify("艾拉", text)
+        if not self.isVisible():
             return
-        if interrupt:
-            self._ground_now()
+        if self.fullscreen_quiet and not (force or interrupt):
+            return
         self.bubble.theme = self.save.get("theme", "樱花粉")
         r = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
         self.bubble.popup(text, r, interrupt=interrupt)
@@ -1168,12 +1245,15 @@ class IslaPet(QWidget):
             return
         self.fullscreen_quiet = now_full
         if now_full:
-            self._stop_wander()
-            self._notify("艾拉", "你在忙……我先安静一会儿。")
+            self._cancel_interaction()
+            self.bubble.dismiss()
+            if self.drop_anim is not None:
+                self.drop_anim.stop()
         else:
             self.say(self.bank.pick("dnd_off"))
 
     def _greet(self):
+        self._begin_interaction()
         h = datetime.now().hour
         if 0 <= h < 5:
             key = "greeting_late_night"
@@ -1223,8 +1303,8 @@ class IslaPet(QWidget):
         if note:
             queue.append(note)
         for i, (key, fmt) in enumerate(queue):
-            QTimer.singleShot(i * 5200,
-                              lambda k=key, f=fmt: self.say(self.bank.pick(k, **f)))
+            self._schedule_interaction(i * 5200,
+                                       lambda k=key, f=fmt: self.say(self.bank.pick(k, **f)))
 
     def _anniversary_note(self):
         """纪念日：当天报喜，7 天内报倒数。"""
@@ -1342,8 +1422,8 @@ class IslaPet(QWidget):
             if self.save["affection"] >= t and unlocked <= i:
                 self.save["unlocked"] = i + 1
                 hid = self.bank.data.get("hidden") or ["……"]
-                QTimer.singleShot(4500, lambda line=hid[min(i, len(hid) - 1)]:
-                                  self.say("（悄悄话）" + line))
+                self._schedule_interaction(4500, lambda line=hid[min(i, len(hid) - 1)]:
+                                           self.say("（悄悄话）" + line))
                 break
         self._check_achievements()
 
@@ -1353,8 +1433,9 @@ class IslaPet(QWidget):
             self._scare()
             e.accept()
             return
-        self._wake()
-        self._stop_wander()
+        if self.drop_anim is not None:
+            self.drop_anim.stop()
+        self._begin_interaction()
         if e.button() == Qt.LeftButton:
             self.press_pos = e.globalPosition().toPoint()
             self.press_local = e.position().toPoint()
@@ -1396,15 +1477,15 @@ class IslaPet(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
-        self.click_timer.stop()
-        self._wake()
+        self._begin_interaction()
         self._set_temp_state("panic", 1.2)
-        QTimer.singleShot(1200, lambda: self._set_temp_state("shy", 2.0))
+        self._schedule_interaction(1200, lambda: self._set_temp_state("shy", 2.0))
         self.say(self.bank.pick("double_click"), interrupt=True)
         self._spawn_hearts(4)
         self.add_affection(3)
 
     def _single_click(self):
+        self._begin_interaction()
         # 点头顶 = 摸头（开心 + 爱心），点身体 = 普通害羞
         local = getattr(self, "press_local", None)
         if local is not None and local.y() < self.height() * 0.34:
@@ -1556,6 +1637,7 @@ class IslaPet(QWidget):
 
     # ---------- 互动玩法 ----------
     def _brew_tea(self):
+        self._begin_interaction()
         self._set_temp_state("tea", 4.0)
         self.say(self.bank.pick("tea"), interrupt=True)
         self.add_affection(2)
@@ -1563,6 +1645,7 @@ class IslaPet(QWidget):
         self._record_memory("tea_1", "memory_first_tea")
 
     def _feed(self):
+        self._begin_interaction()
         self._set_temp_state("shy", 3.0)
         self.hop_ticks = 16          # 连蹦两下
         self._spawn_hearts(5)
@@ -1572,17 +1655,17 @@ class IslaPet(QWidget):
         self._record_memory("feed_1", "memory_first_feed")
 
     def _play_rps(self, mine):
-        """0 石头 1 剪刀 2 布；她随机出拳，先慌张思考再公布结果。"""
+        self._begin_interaction()
         hers = random.randrange(3)
         if hers == mine:
             key = "rps_draw"
-        elif (mine - hers) % 3 == 1:   # 玩家赢（石头>剪刀>布>石头）
-            key = "rps_lose"           # 她输
+        elif (mine - hers) % 3 == 1:
+            key = "rps_win"
         else:
-            key = "rps_win"            # 她赢
+            key = "rps_lose"
         self._set_temp_state("panic", 1.0)
         self.say("我出……%s！" % RPS[hers], interrupt=True)
-        QTimer.singleShot(1400, lambda: self._rps_result(key))
+        self._schedule_interaction(1400, lambda: self._rps_result(key))
         self.add_affection(1)
 
     def _rps_result(self, key):
@@ -1599,7 +1682,7 @@ class IslaPet(QWidget):
 
     # ---------- 新玩法：骰子 / 硬币 / 跳舞 / 惊吓 ----------
     def _roll_dice(self):
-        """掷一个六面骰，点数决定她的反应。"""
+        self._begin_interaction()
         n = random.randint(1, 6)
         self._bump("dice")
         self._set_temp_state("panic", 0.9)
@@ -1612,15 +1695,15 @@ class IslaPet(QWidget):
         else:
             key = "dice_mid"
         self.say(self.bank.pick(key, num=n), interrupt=True)
-        QTimer.singleShot(1300, lambda: self._set_temp_state("idle", 0.4))
+        self._schedule_interaction(1300, lambda: self._set_temp_state("idle", 0.4))
 
     def _flip_coin(self):
-        """抛硬币：正面 / 反面。"""
+        self._begin_interaction()
         head = random.random() < 0.5
         self._bump("coin")
         self._set_temp_state("panic", 1.0)
         self.say("抛……！", interrupt=True)
-        QTimer.singleShot(1200, lambda: self._coin_result(head))
+        self._schedule_interaction(1200, lambda: self._coin_result(head))
 
     def _coin_result(self, head):
         self._set_temp_state("shy", 1.8)
@@ -1629,7 +1712,7 @@ class IslaPet(QWidget):
         self.say(self.bank.pick(key, side=side), interrupt=True)
 
     def _dance(self):
-        """跳舞：随机姿势序列 4 秒 + 星星音符粒子。"""
+        self._begin_interaction()
         self._bump("dance")
         self._record_memory("dance_1", "memory_first_dance")
         self.dance_seq = random.sample(
@@ -1637,16 +1720,16 @@ class IslaPet(QWidget):
         self.say(self.bank.pick("dance"), interrupt=True)
         self._dance_step()
         self._spawn_particles(8, "star", vy=(-1.4, -0.5), life=(12, 20))
-        self.dance_timer.start(500)
 
     def _dance_step(self):
         if self.dance_seq:
-            self.state = self.dance_seq.pop(0)
-            self.update()
-            self.dance_timer.start(500)
+            self._set_temp_state(self.dance_seq.pop(0), 1.0)
+            self.dance_timer.start(1000)
+        else:
+            self._set_temp_state("idle", 0.0)
 
     def _scare(self):
-        """中键单击：吓她一跳（彩蛋）。"""
+        self._begin_interaction()
         self._bump("scare")
         self._set_temp_state("panic", 1.6)
         self.hop_ticks = 10
@@ -1686,8 +1769,8 @@ class IslaPet(QWidget):
             return
         mem[key] = date.today().isoformat()
         if line_key:
-            QTimer.singleShot(4600,
-                              lambda: self.say(self.bank.pick(line_key)))
+            self._schedule_interaction(4600,
+                                       lambda: self.say(self.bank.pick(line_key)))
         self.save_data()
 
     # ---------- 成就系统 ----------
@@ -1705,7 +1788,7 @@ class IslaPet(QWidget):
             if ok:
                 got.add(aid)
                 if not silent:
-                    QTimer.singleShot(3600, lambda n=name: self.say(
+                    self._schedule_interaction(3600, lambda n=name: self.say(
                         self.bank.pick("achievement", name=n)))
         self.save["achievements"] = sorted(got)
 
@@ -1800,6 +1883,7 @@ class IslaPet(QWidget):
                 ("凶", "fortune_bad"), ("大吉", "fortune_big"))
 
     def _fortune(self):
+        self._begin_interaction()
         today = date.today().isoformat()
         cur = self.save.get("fortune")
         if cur and cur[0] == today:
@@ -1942,6 +2026,7 @@ class IslaPet(QWidget):
 
     # ---------- 全屏烟花 ----------
     def _show_firework(self):
+        self._begin_interaction()
         self._bump("firework")
         self._record_memory("firework_1", "memory_first_firework")
         if self.firework is None:
@@ -1970,6 +2055,8 @@ class IslaPet(QWidget):
         return "%02d:%02d" % (left // 60, left % 60)
 
     def _pomo_start(self, phase="focus"):
+        if phase == "focus":
+            self._begin_interaction()
         mins = self.save.get("pomo_focus", 25) if phase == "focus" \
             else self.save.get("pomo_break", 5)
         self.pomo_state = phase
@@ -1980,6 +2067,7 @@ class IslaPet(QWidget):
         self.add_affection(1)
 
     def _pomo_stop(self):
+        self._begin_interaction()
         self.pomo_state = None
         self.pomo_end = None
         self.say(self.bank.pick("pomodoro_stop"), interrupt=True)
@@ -2035,22 +2123,25 @@ class IslaPet(QWidget):
 
     # ---------- 打气 / 深呼吸（v2.2 新增互动） ----------
     def _cheer(self):
-        """给你打打气：一句鼓励 + 一个加油的小动作。"""
+        self._begin_interaction()
+        self._set_temp_state("shy", 2.0)
         self.hop_ticks = 12
         self._spawn_hearts(6)
         self.say(self.bank.pick("cheer"), interrupt=True)
         self.add_affection(1)
+        self._bump("cheer")
 
     def _relax(self):
-        """陪你做一轮 4-4-4 深呼吸：吸气-屏息-呼气，节奏提示。"""
         if self._relaxing:
             return
+        self._begin_interaction()
         self._relaxing = True
-        self._stop_wander()
         self.say(self.bank.pick("relax_in"), interrupt=True)
-        QTimer.singleShot(4000, lambda: self.say(self.bank.pick("relax_hold"), interrupt=True))
-        QTimer.singleShot(8000, lambda: self.say(self.bank.pick("relax_out"), interrupt=True))
-        QTimer.singleShot(12000, self._relax_done)
+        self._schedule_interaction(RELAX_PHASE_MS, lambda: self.say(
+            self.bank.pick("relax_hold"), interrupt=True))
+        self._schedule_interaction(RELAX_PHASE_MS * 2, lambda: self.say(
+            self.bank.pick("relax_out"), interrupt=True))
+        self._schedule_interaction(RELAX_PHASE_MS * 3, self._relax_done)
 
     def _relax_done(self):
         self._relaxing = False
@@ -2058,6 +2149,7 @@ class IslaPet(QWidget):
         self.add_affection(1)
 
     def _pc_status(self):
+        self._begin_interaction()
         pct = self._memory_percent()
         key = "pc_status_busy" if pct >= 75 else "pc_status_ok"
         self.say(self.bank.pick(key, mem=pct), interrupt=True)
@@ -2145,6 +2237,7 @@ class IslaPet(QWidget):
         self.say("好的……专注 %d 分钟，休息 %d 分钟。" % (focus, brk))
 
     def _quit(self):
+        self._begin_interaction()
         self.say(self.bank.pick("farewell"), interrupt=True)
         self.save_data()
         QTimer.singleShot(900, QApplication.quit)
