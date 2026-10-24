@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QInputDialog, QLabel,
                                QVBoxLayout, QWidget)
 
 APP_NAME = "IslaPet"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 BASE_HEIGHTS = {"小 (200px)": 200, "中 (260px)": 260, "大 (320px)": 320}
 DEFAULT_SIZE = "中 (260px)"
 
@@ -106,6 +106,11 @@ WALK_SWAY = 1.3                     # 行走左右轻摆 px
 ENTRANCE_MS = 1200                  # 开机出场动画时长
 ENTRANCE_START_SCALE = 0.28         # 出场起始缩放（从脚底放大登场）
 RELAX_PHASE_MS = 4000
+WATER_REMIND_SECONDS = 5400         # 喝水提醒间隔（1.5 小时）
+PAT_STREAK_TRIGGER = 5              # 连续摸头几次触发彩蛋
+PAT_STREAK_WINDOW_TICKS = 60        # 连击有效窗口（6 秒）
+AUTOSTART_VALUE = "IslaPet"
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 MAX_PARTICLES = 120
 INITIATIVE_CD = (2400, 4800)        # 主动搭话冷却 tick 范围
 BLINK_CHANCE = 0.03                 # 待机每帧眨眼概率
@@ -185,6 +190,7 @@ def _def_achievements():
 DEFAULT_SAVE = {
     "affection": 0, "unlocked": 0, "pos": None, "size_key": DEFAULT_SIZE,
     "chime_on": True, "sit_on": True, "sleep_on": True, "wander_on": True,
+    "water_on": True,            # 喝水提醒开关
     "brief_on": True, "brief_date": None,   # 每日早报开关 / 当天已读日期
     "follow_on": False, "initiative_on": True,
     "mood": 60,                  # 心情 0~100
@@ -582,6 +588,7 @@ class IslaPet(QWidget):
         self.minute_timer.start(MINUTE_CHECK_MS)
         self.last_chimed_hour = datetime.now().hour
         self.sit_start = datetime.now()
+        self.water_start = datetime.now()
         self.sleep_reminded_day = None
         self._relaxing = False       # 深呼吸引导进行中（防重入）
 
@@ -600,6 +607,8 @@ class IslaPet(QWidget):
 
         self.hearts = []             # 通用粒子 [x, y, vx, vy, life, type]
         self.hop_ticks = 0           # 投喂/开心时的小跳剩余 tick
+        self.pat_streak = 0          # 连续摸头计数（彩蛋用）
+        self.pat_streak_ticks = 0    # 连击有效剩余 tick
         self.initiative_cd = random.randint(*INITIATIVE_CD)  # 主动搭话冷却
         self.mood_decay = 0          # 心情衰减计时
         self._sad_hint_done = False  # 心情低谷求助提示（只提示一次）
@@ -1040,6 +1049,8 @@ class IslaPet(QWidget):
 
     # ---------- 动画心跳 ----------
     def _tick(self):
+        if not self.isVisible():     # 隐藏到托盘时暂停动画心跳，省 CPU（提醒走独立定时器）
+            return
         self.breath_phase = (self.breath_phase + BREATH_SPEED) % (2 * math.pi)
         if self._wandering():
             self.walk_phase = (self.walk_phase + WALK_SPEED) % (2 * math.pi)
@@ -1053,6 +1064,10 @@ class IslaPet(QWidget):
             self._update_hearts()
         if self.hop_ticks > 0:
             self.hop_ticks -= 1
+        if self.pat_streak_ticks > 0:
+            self.pat_streak_ticks -= 1
+            if self.pat_streak_ticks == 0:
+                self.pat_streak = 0
         self._mood_tick()
 
         if self.temp_state_ticks > 0:
@@ -1490,10 +1505,12 @@ class IslaPet(QWidget):
         local = getattr(self, "press_local", None)
         if local is not None and local.y() < self.height() * 0.34:
             self._set_temp_state("shy", 2.4)
-            self._spawn_hearts(7)
+            bonus = self._pat_hit()        # 连续摸头 5 次触发彩蛋
+            self._spawn_hearts(12 if bonus else 7)
             self.hop_ticks = 8
-            self.say(self.bank.pick("head_pat"), interrupt=True)
-            self.add_affection(2)
+            self.say(self.bank.pick("pat_streak" if bonus else "head_pat"),
+                     interrupt=True)
+            self.add_affection(2 if not bonus else 3)
             self._bump("pat")
             self._record_memory("pat_1", "memory_first_pat")
         else:
@@ -1501,6 +1518,15 @@ class IslaPet(QWidget):
             self.say(self.bank.pick("click_shy"), interrupt=True)
             self.add_affection(1)
             self._bump("click")
+
+    def _pat_hit(self):
+        """记录一次摸头；连击达到阈值时返回 True（触发彩蛋并归零）。"""
+        self.pat_streak += 1
+        self.pat_streak_ticks = PAT_STREAK_WINDOW_TICKS
+        if self.pat_streak >= PAT_STREAK_TRIGGER:
+            self.pat_streak = 0
+            return True
+        return False
 
     def contextMenuEvent(self, e):
         self._wake()
@@ -1574,6 +1600,7 @@ class IslaPet(QWidget):
         rem = m.addMenu("提醒设置")
         for key, label in (("chime_on", "整点报时"),
                            ("sit_on", "久坐提醒 (1小时)"),
+                           ("water_on", "喝水提醒 (1.5小时)"),
                            ("sleep_on", "23:30 睡觉提醒")):
             act = QAction(label, rem)
             act.setCheckable(True)
@@ -1586,6 +1613,11 @@ class IslaPet(QWidget):
         pref.addAction("设置我的生日…", self._set_birthday)
         pref.addAction("设置纪念日…", self._set_anniversary)
         pref.addAction("番茄钟时长…", self._set_pomodoro)
+        act = QAction("开机自启", pref)
+        act.setCheckable(True)
+        act.setChecked(self._is_autostart_on())
+        act.toggled.connect(self._set_autostart)
+        pref.addAction(act)
         th = pref.addMenu("主题换肤")
         for name, t in THEMES.items():
             act = QAction(t["desc"], th)
@@ -2236,6 +2268,45 @@ class IslaPet(QWidget):
         self.save["pomo_break"] = brk
         self.say("好的……专注 %d 分钟，休息 %d 分钟。" % (focus, brk))
 
+    # ---------- 开机自启（仅当前用户 HKCU\...\Run） ----------
+    def _autostart_command(self):
+        """返回写入注册表的启动命令（打包版直接用 exe 路径）。"""
+        if getattr(sys, "frozen", False):
+            return '"%s"' % os.path.abspath(sys.executable)
+        return '"%s" "%s"' % (sys.executable,
+                              os.path.abspath(os.path.join(
+                                  os.path.dirname(__file__), "isla_pet.py")))
+
+    def _is_autostart_on(self):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
+                winreg.QueryValueEx(k, AUTOSTART_VALUE)
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return False
+
+    def _set_autostart(self, on):
+        """开启/关闭开机自启；失败时静默并复位菜单勾选。"""
+        try:
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
+                if on:
+                    winreg.SetValueEx(k, AUTOSTART_VALUE, 0, winreg.REG_SZ,
+                                      self._autostart_command())
+                else:
+                    try:
+                        winreg.DeleteValue(k, AUTOSTART_VALUE)
+                    except OSError:
+                        pass
+            self.save_data()
+            return True
+        except Exception as exc:
+            logging.warning("开机自启设置失败：%s", exc)
+            return False
+
     def _quit(self):
         self._begin_interaction()
         self.say(self.bank.pick("farewell"), interrupt=True)
@@ -2279,8 +2350,22 @@ class IslaPet(QWidget):
                 and now.minute >= 30 and self.sleep_reminded_day != date.today():
             self.sleep_reminded_day = date.today()
             self.say(self.bank.pick("sleep_reminder"))
+        # 喝水提醒：每 1.5 小时一次
+        if not quiet:
+            self._water_check(now)
         # 每天 BRIEF_MIN_HOUR 点后自动补发一次早报（当天未读过时）
         self._brief_maybe_auto()
+
+    def _water_check(self, now=None):
+        """到达喝水间隔则提醒一次并重新计时；返回是否触发。"""
+        if not self.save.get("water_on", True):
+            return False
+        now = now or datetime.now()
+        if (now - self.water_start).total_seconds() < WATER_REMIND_SECONDS:
+            return False
+        self.water_start = now
+        self.say(self.bank.pick("water_reminder"), interrupt=True)
+        return True
 
 
 def main():

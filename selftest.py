@@ -941,6 +941,49 @@ check("白噪音静音替身开关及恢复", _test_silent_audio)
 check("互动 QTimer 执行一次及取消", _test_interaction_timers)
 check("新互动清理旧回调/舞蹈/出场/气泡", _test_interaction_cleanup)
 check("say interrupt 仅替换气泡不清理动作", _test_say_only_replaces_bubble)
+def _test_water_reminder():
+    pet._begin_interaction()
+    pet.save["water_on"] = True
+    pet.water_start = isla_pet.datetime.now() - timedelta(
+        seconds=isla_pet.WATER_REMIND_SECONDS + 5)
+    assert pet._water_check() is True, "到点应提醒"
+    assert pet._water_check() is False, "提醒后应重新计时"
+    pet.save["water_on"] = False
+    pet.water_start = isla_pet.datetime.now() - timedelta(
+        seconds=isla_pet.WATER_REMIND_SECONDS + 5)
+    assert pet._water_check() is False, "关闭开关后不应提醒"
+    pet.save["water_on"] = True
+
+
+def _test_pat_streak():
+    pet.pat_streak = 0
+    pet.pat_streak_ticks = 0
+    for _ in range(isla_pet.PAT_STREAK_TRIGGER - 1):
+        assert pet._pat_hit() is False
+    assert pet._pat_hit() is True and pet.pat_streak == 0, "第 5 次应触发并归零"
+
+
+def _test_autostart_command():
+    cmd = pet._autostart_command()
+    assert isinstance(cmd, str) and cmd, "启动命令为空"
+    assert ("IslaPet" in cmd or "isla_pet.py" in cmd
+            or "python" in cmd.lower()), "启动命令不含可执行目标"
+
+
+def _test_hidden_tick_paused():
+    before = pet.idle_ticks
+    pet.hide()
+    app.processEvents()
+    pet._tick()
+    assert pet.idle_ticks == before, "隐藏时心跳应暂停"
+    pet.show()
+    app.processEvents()
+
+
+check("喝水提醒：到点触发并重新计时", _test_water_reminder)
+check("摸头连击彩蛋：5 次触发并归零", _test_pat_streak)
+check("开机自启命令生成（不写注册表）", _test_autostart_command)
+check("隐藏到托盘时暂停动画心跳", _test_hidden_tick_paused)
 check("没有沙箱外写入或真实联网", lambda: (
     not _violations or (_ for _ in ()).throw(AssertionError(str(_violations)))))
 
